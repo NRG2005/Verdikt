@@ -1,3 +1,0 @@
-Loaded 2000 rows.
-Max score found: 0.3796
-Found 0 suspicious transactions.

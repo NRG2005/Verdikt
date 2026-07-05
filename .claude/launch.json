@@ -1,12 +1,4 @@
 {
   "version": "0.0.1",
-  "configurations": [
-    {
-      "name": "regulatory-ui",
-      "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "4000"],
-      "port": 4000,
-      "cwd": "regulatory-ui"
-    }
-  ]
+  "configurations": []
 }
