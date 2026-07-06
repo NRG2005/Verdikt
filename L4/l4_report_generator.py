@@ -127,16 +127,17 @@ def _build_prompt(l3_verdict, l2_evidence, transaction, repair_errors):
     )
     contract = {
         "main_person_name": "<principal suspect name>",
-        "suspicion_indicator": "<one of suspicion_indicator list>",
+        "suspicion_indicator": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('suspicion_indicator', [])) + "> (Hint: C1 maps to STRUCTURING, C2 to SANCTIONS_MATCH, C3 to NETWORK_FLOW, C4 to ACCOUNT_RISK, C5 to CROSS_BORDER_LRS, C6 to GEO_ANOMALY)",
         "grounds_of_suspicion": "<short narrative from verdict + clause>",
-        "funds_code": "<one of funds_code list>",
-        "transaction_mode": "<one of transaction_mode list>",
+        "funds_code": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('funds_code', [])) + ">",
+        "transaction_mode": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('transaction_mode', [])) + ">",
         "customer": {"role": "SENDER|RECEIVER", "name": "", "pan": "", "dob": ""},
         "related_person": {"role": "SENDER|RECEIVER", "name": "", "pan": "", "dob": ""},
     }
     payload = {
         "instructions": instructions,
         "allowed_enums": enum_block,
+        "category_mapping_hint": CATEGORY_TO_INDICATOR,
         "output_contract": contract,
         "l3_verdict": l3_verdict,
         "l2_evidence": l2_evidence,
@@ -283,11 +284,11 @@ def serialize(slm_json, l3_verdict, transaction):
 
     sd = el(report, "SuspicionDetails")
     
-    suspicion_ind = slm_json.get("suspicion_indicator", "STRUCTURING")
+    suspicion_ind = slm_json.get("suspicion_indicator") or "STRUCTURING"
     if suspicion_ind.startswith("<"): suspicion_ind = "STRUCTURING"
     el(sd, "SuspicionType", suspicion_ind)
     
-    grounds = slm_json.get("grounds_of_suspicion", "Suspicious activity detected")
+    grounds = slm_json.get("grounds_of_suspicion") or "Suspicious activity detected"
     if grounds.startswith("<"): grounds = "Suspicious activity detected"
     el(sd, "GroundsOfSuspicion", grounds)
 
@@ -297,9 +298,12 @@ def serialize(slm_json, l3_verdict, transaction):
     if isinstance(citation_trail, list) and len(citation_trail) > 0:
         lines = []
         for c in citation_trail:
-            desig = c.get("rule_designation", "")
-            excerpt = c.get("excerpt", "")
-            lines.append(f"Rule {desig}: {excerpt}".strip())
+            if isinstance(c, str):
+                lines.append(c)
+            elif isinstance(c, dict):
+                desig = c.get("rule_designation", c.get("clause_no", ""))
+                excerpt = c.get("excerpt", c.get("clause", ""))
+                lines.append(f"Rule {desig}: {excerpt}".strip())
         citation_value = "\n".join(lines)
         el(sd, "RegulationCitation", citation_value)
     else:
@@ -315,7 +319,7 @@ def serialize(slm_json, l3_verdict, transaction):
     txn_date_fmt = txn_date_raw[:10] if txn_date_raw else batch_date
     el(txn, "TransactionDate", txn_date_fmt) # L0 (txn date!)
     
-    mode = slm_json.get("transaction_mode", "UPI")
+    mode = slm_json.get("transaction_mode") or "UPI"
     if mode.startswith("<"): mode = "UPI"
     el(txn, "TransactionMode", mode)        # SLM (enum)
     
@@ -323,7 +327,7 @@ def serialize(slm_json, l3_verdict, transaction):
     el(txn, "Amount", str(transaction.get("amount_inr", transaction.get("amount", "0"))))    # L0
     el(txn, "Currency", transaction.get("currency", "INR"))  # L0
     
-    funds = slm_json.get("funds_code", "K")
+    funds = slm_json.get("funds_code") or "K"
     if funds.startswith("<"): funds = "K"
     el(txn, "FundsCode", funds)         # SLM (enum)
 

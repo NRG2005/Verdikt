@@ -78,7 +78,7 @@ class TransactionRequest(BaseModel):
     fx_usd_inr: str = ""
     beneficiary_id: str = ""
 
-    model_config = {"extra": "ignore"}  # silently drop any unexpected fields
+    model_config = {"extra": "allow"}  # preserve uploaded CSV columns for downstream checks
 
 
 # ── SSE helper ────────────────────────────────────────────────────────────────
@@ -115,14 +115,14 @@ async def stream_transaction(tx: TransactionRequest):
             json.dump(tx_dict_str, f, indent=2)
 
         # ── Field name bridge ─────────────────────────────────────────────────
-        # transactions.csv column is 'receiver_account_id' (values like EXT74234).
-        # The frontend maps it to 'receiver_account_external' (Transaction type).
-        # Re-expose under 'receiver_account_id' so c1_adapter same-beneficiary
-        # clustering and c3 graph traversal resolve the correct receiver node.
-        tx_dict_str["receiver_account_id"] = tx.receiver_account_external
-        tx_dict_str["receiver_pan"] = tx.receiver_pan
-        tx_dict_str["receiver_dob"] = tx.receiver_dob
-        tx_dict_str["receiver_cin"] = ""
+        # Prefer the explicit receiver_account_id when the UI provides it, else
+        # fall back to the legacy receiver_account_external mapping.
+        tx_dict_str["receiver_account_id"] = (
+            tx_dict_str.get("receiver_account_id")
+            or tx_dict_str.get("receiver_account_external")
+            or ""
+        )
+        tx_dict_str["receiver_cin"] = tx_dict_str.get("receiver_cin", "")
         # Use CSV's is_cross_border when present; fall back to SWIFT channel detection.
         # Cross-border determination
         is_foreign = False
@@ -140,11 +140,12 @@ async def stream_transaction(tx: TransactionRequest):
         )
         tx_dict_str["usd_equiv"] = tx.usd_equiv if tx.usd_equiv else str(float(tx.amount_inr) / 83.0)
         tx_dict_str["fx_usd_inr"] = tx.fx_usd_inr if tx.fx_usd_inr else "83.0"
-        tx_dict_str["beneficiary_id"] = tx.beneficiary_id or tx.receiver_account_external
-        tx_dict_str["sender_pan"] = tx.sender_pan
-        tx_dict_str["tx_location_country"] = tx.tx_location_country
-        tx_dict_str["tx_location_lat"] = tx.tx_location_lat
-        tx_dict_str["tx_location_lon"] = tx.tx_location_lon
+        tx_dict_str["beneficiary_id"] = (
+            tx_dict_str.get("beneficiary_id")
+            or tx_dict_str["receiver_account_id"]
+            or tx_dict_str.get("receiver_account_external")
+            or ""
+        )
 
         try:
             # ── L0: Publish to Azure Queue Storage ───────────────────────────
@@ -331,6 +332,22 @@ async def stream_transaction(tx: TransactionRequest):
                             "explanation": state.get("explanation", ""),
                         }
                         
+                        # ── L3.5: Maker-Checker Validation (Local Ollama) ───────────
+                        try:
+                            from L3_regulation_interpreter.maker_checker import run_maker_checker
+                            import logging as _log
+                            _log.warning("[L3.5] Running Maker-Checker Explainability Agent...")
+                            
+                            # Run Maker Checker
+                            mc_explanation = run_maker_checker(tx_dict_str, l3_verdict_obj, model="qwen2.5:72b")
+                            l3_verdict_obj["maker_checker_explanation"] = mc_explanation
+                            state["maker_checker_explanation"] = mc_explanation
+                            
+                            # Emulate an event to show on backend logs
+                            _log.warning(f"[L3.5] Maker-Checker output: {mc_explanation[:100]}...")
+                        except Exception as e:
+                            l3_verdict_obj["maker_checker_explanation"] = f"Maker-Checker validation offline or failed: {e}"
+                        
                         try:
                             from L4.l4_report_generator import run_l4, write_pdf_review_copy
                             l4_result = run_l4(l3_verdict_obj, l2_evidence, tx_l4)
@@ -456,6 +473,9 @@ async def stream_transaction(tx: TransactionRequest):
                 "processing_time_ms": int((time.monotonic() - start) * 1000),
                 "layer_events": layer_events,
             }
+            if "maker_checker_explanation" in state:
+                result["maker_checker_explanation"] = state["maker_checker_explanation"]
+                
             if str_pdf_url:
                 result["str_pdf_url"] = str_pdf_url
                 state["str_pdf_url"] = str_pdf_url

@@ -152,30 +152,29 @@ def generate_legal_analysis(event, retrieval):
         azure_analysis = None
         nomic_analysis = None
         fallback_reason = "LLM not configured."
-        if is_llm_configured():
-            # Evaluate Azure Chunks
-            try:
-                if azure_chunks:
-                    azure_analysis = chat_json(
-                        system_prompt=SYSTEM_PROMPT,
-                        user_prompt=_build_reasoning_prompt(event, azure_chunks),
-                    )
-                    azure_analysis["backend_used"] = "azure_ai_search"
-            except Exception as exc:
-                print(f"L3: Azure evaluation failed: {exc}")
 
-            # Evaluate Local Nomic Chunks
-            try:
-                if nomic_chunks:
-                    nomic_analysis = chat_json(
-                        system_prompt=SYSTEM_PROMPT,
-                        user_prompt=_build_reasoning_prompt(event, nomic_chunks),
-                    )
-                    nomic_analysis["backend_used"] = "local_nomic_search"
-            except Exception as exc:
-                print(f"L3: Local Nomic evaluation failed: {exc}")
-        else:
-            fallback_reason = "LLM not configured (no API key)."
+        # chat_json() already falls back to local Ollama when GEMINI_API_KEY
+        # is unset, so always attempt the call rather than gating on
+        # is_llm_configured() (which only checks for the Gemini key).
+        try:
+            if azure_chunks:
+                azure_analysis = chat_json(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=_build_reasoning_prompt(event, azure_chunks),
+                )
+                azure_analysis["backend_used"] = "azure_ai_search"
+        except Exception as exc:
+            print(f"L3: Azure evaluation failed: {exc}")
+
+        try:
+            if nomic_chunks:
+                nomic_analysis = chat_json(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=_build_reasoning_prompt(event, nomic_chunks),
+                )
+                nomic_analysis["backend_used"] = "local_nomic_search"
+        except Exception as exc:
+            print(f"L3: Local Nomic evaluation failed: {exc}")
 
         # Determine the winner (highest final_score)
         winner = None
