@@ -332,6 +332,22 @@ async def stream_transaction(tx: TransactionRequest):
                             "explanation": state.get("explanation", ""),
                         }
                         
+                        # ── L3.5: Maker-Checker Validation (Local Ollama) ───────────
+                        try:
+                            from L3_regulation_interpreter.maker_checker import run_maker_checker
+                            import logging as _log
+                            _log.warning("[L3.5] Running Maker-Checker Explainability Agent...")
+                            
+                            # Run Maker Checker
+                            mc_explanation = run_maker_checker(tx_dict_str, l3_verdict_obj, model="qwen2.5:72b")
+                            l3_verdict_obj["maker_checker_explanation"] = mc_explanation
+                            state["maker_checker_explanation"] = mc_explanation
+                            
+                            # Emulate an event to show on backend logs
+                            _log.warning(f"[L3.5] Maker-Checker output: {mc_explanation[:100]}...")
+                        except Exception as e:
+                            l3_verdict_obj["maker_checker_explanation"] = f"Maker-Checker validation offline or failed: {e}"
+                        
                         try:
                             from L4.l4_report_generator import run_l4, write_pdf_review_copy
                             l4_result = run_l4(l3_verdict_obj, l2_evidence, tx_l4)
@@ -457,6 +473,9 @@ async def stream_transaction(tx: TransactionRequest):
                 "processing_time_ms": int((time.monotonic() - start) * 1000),
                 "layer_events": layer_events,
             }
+            if "maker_checker_explanation" in state:
+                result["maker_checker_explanation"] = state["maker_checker_explanation"]
+                
             if str_pdf_url:
                 result["str_pdf_url"] = str_pdf_url
                 state["str_pdf_url"] = str_pdf_url

@@ -1,6 +1,7 @@
 import React from 'react'
 import { S } from './styleStr'
 import { Hover } from './Hover'
+import { TransactionTable } from './TransactionTable'
 
 // ============================================================================
 // React (Vite) port of the Compliance Pipeline regulatory UI.
@@ -129,7 +130,8 @@ export default class App extends React.Component {
         record,
         fields: [['tx_id', get('tx_id') || '—'], ['timestamp', get('timestamp') || '—'], ['channel', ch], ['amount_inr', amt.replace('.00', '')], ['sender_account_id', maskAcct], ['sender_name', get('sender_name') || '—'], ['receiver_name', get('receiver_name') || '—'], ['purpose_code', get('purpose_code') || '—']],
         results: { sanctions: { v: 'clear', note: 'No name on any watch-list' }, device: { v: 'clear', note: 'Uploaded record' }, split: { v: 'clear', note: 'Single payment' }, behaviour: { v: 'clear', note: 'From uploaded file' }, crossborder: { v: 'clear', note: 'Within limits' }, mule: { v: 'clear', note: 'Direct transfer' } },
-        verdict: { tone: 'clear', title: 'AUTO-CLEARED', line: 'Uploaded transaction — no flags raised.' }
+        verdict: { tone: 'clear', title: 'AUTO-CLEARED', line: 'Uploaded transaction — no flags raised.' },
+        graphType: '_live'
       })
     }
     return out
@@ -215,7 +217,7 @@ export default class App extends React.Component {
     // short-circuit: reportable verdict reached (e.g. L1 MinHash match) without L2 checks firing.
     // In that case there are no fresh agent flags, so the caller should keep the authored red results.
     const shortCircuited = fired.length === 0 && verdict.tone !== 'clear'
-    return { results, verdict, clearGraph: verdict.tone === 'clear', shortCircuited }
+    return { results, verdict: { ...verdict, confidence: result.confidence || result.composite_score }, clearGraph: verdict.tone === 'clear', shortCircuited }
   }
 
   streamPipeline(payload) {
@@ -255,6 +257,7 @@ export default class App extends React.Component {
       // authored red results so the agents still show their hit/flag states (don't zero them out).
       if (!m.shortCircuited) sample.results = m.results
       sample.verdict = m.verdict
+      sample.liveCites = result.regulatory_basis || []
       sample.strPdfUrl = result.str_pdf_url || null
       if (m.clearGraph) sample.graphType = null
       sample.live = true
@@ -354,7 +357,8 @@ export default class App extends React.Component {
     velocity: { pick: ['sanctions', 'velocity', 'mule', 'structuring'], why: 'A burst of low-value UPI debits to many first-time payees — orchestrator dispatched velocity, mule and structuring agents plus sanctions. FEMA and geo agents skipped (domestic UPI, one device).' },
     geo: { pick: ['sanctions', 'geo', 'velocity', 'fema'], why: 'Card-not-present authorisation cleared through a foreign acquirer — orchestrator dispatched the geolocation, velocity and FEMA agents plus sanctions. Structuring and mule agents left idle (single authorisation).' },
     fema: { pick: ['sanctions', 'fema', 'velocity'], why: 'A large cross-border SWIFT remittance — orchestrator dispatched the FEMA/LRS and velocity agents plus a sanctions/adverse-media screen. Structuring, mule and geo agents were not relevant to a single outward wire.' },
-    _clean: { pick: ['sanctions', 'structuring'], why: 'A low-value domestic NEFT to a known, previously-paid counterparty — orchestrator invoked only the baseline sanctions and structuring screens. No behavioural, cross-border or network agents were required.' }
+    _clean: { pick: ['sanctions', 'structuring'], why: 'A low-value domestic NEFT to a known, previously-paid counterparty — orchestrator invoked only the baseline sanctions and structuring screens. No behavioural, cross-border or network agents were required.' },
+    _live: { pick: ['structuring', 'sanctions', 'mule', 'velocity', 'fema', 'geo'], why: 'Live transaction ingested via API. The orchestrator dynamically routes it to all active screening agents for comprehensive real-time risk assessment.' }
   }
   routeFor(sample) { return this.ROUTES[sample && sample.graphType] || this.ROUTES._clean }
   scoreFor(v, i) {
@@ -864,7 +868,7 @@ export default class App extends React.Component {
       geo: { conf: 91, rule: 'FRD-GEO-009 · Impossible travel', summary: 'Two authenticated sessions ~11,000 km apart within 9 minutes on one credential — strong account-takeover indicator.' },
       fema: { conf: 99, rule: 'FEMA-LRS-002 · Outward-remittance ceiling', summary: 'Cumulative outward remittance of USD 268,000 breaches the USD 250,000 LRS financial-year ceiling.' }
     }
-    const cm = S.graphType ? CONFMETA[S.graphType] : { conf: 3, rule: 'STP-000 · No typology match', summary: 'No sanctions, PEP or typology match. Payment straight-through processed and retained in the audit trail.' }
+    const cm = (S.graphType && CONFMETA[S.graphType]) ? CONFMETA[S.graphType] : { conf: V.tone === 'clear' ? 3 : (S.liveCites && S.liveCites.length ? 92 : 75), rule: V.tone === 'clear' ? 'STP-000 · No typology match' : 'L2/L3 · Dynamic detection', summary: V.line || 'Live transaction processed via the orchestrator pipeline.' }
     const cleared = V.tone === 'clear'
     const confTone = cleared ? '#1f9d63' : (cm.conf >= 90 ? '#e0455a' : '#cf861b')
     report.openReport = this.openReport; report.closeReport = this.closeReport; report.stop = this.stopEvt; report.modalOpen = st.reportModal
@@ -925,10 +929,18 @@ export default class App extends React.Component {
         verdictStyle: `flex:none;font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:700;color:${tone};background:${tone}14;border:1px solid ${tone}44;border-radius:7px;padding:3px 8px`
       }
     })
-    const citations = this.citesFor(S).map(c => ({
-      code: c.code, ref: c.ref, note: c.note, url: c.url,
-      badgeStyle: `flex:none;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:11px;color:#fff;background:#2f7fd6;border-radius:7px;padding:4px 9px;letter-spacing:.2px`
-    }))
+    const citations = this.citesFor(S).map(c => {
+      if (typeof c === 'string') {
+        return { code: 'CITATION', ref: '', note: c, url: '', badgeStyle: `flex:none;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:11px;color:#fff;background:#2f7fd6;border-radius:7px;padding:4px 9px;letter-spacing:.2px` }
+      }
+      return {
+        code: (c.clause_no || c.rule_designation || c.chunk_id || 'UNKNOWN').toUpperCase(),
+        ref: (c.citation || c.why_it_matters || ''),
+        note: (c.clause || c.excerpt || ''),
+        url: c.url || '',
+        badgeStyle: `flex:none;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:11px;color:#fff;background:#2f7fd6;border-radius:7px;padding:4px 9px;letter-spacing:.2px`
+      }
+    })
     const outcome = {
       ref: S.reference, amount: S.amount.replace('.00', ''), sender: S.sender, receiver: S.receiver, channel: S.channel,
       tone: V.tone, vtone, title: V.title, line: V.line, icon: vIcon,
@@ -1349,17 +1361,12 @@ export default class App extends React.Component {
         <div style={S('border-left:3px solid #2f7fd6;padding-left:16px;color:#54504a;font-size:13.5px;line-height:1.5;max-width:74ch;margin:20px 0 22px')}>Payments <b style={S('color:#1a1712')}>stream into the queue</b> and are picked up one at a time. Only the transaction currently being <b style={S('color:#1a1712')}>processed</b> is opened — its record shows in a single row with sensitive details <b style={S('color:#1a1712')}>masked</b>. The rest stay sealed until their turn.</div>
 
         {V.ingest.hasUploads && (
-          <div style={S('background:#fffdfa;border:1px solid rgba(0,0,0,.08);border-radius:13px;padding:14px 16px;margin-bottom:20px')}>
-            <div style={S("display:flex;align-items:center;gap:8px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:1.5px;color:#8a8478;margin-bottom:11px")}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#1f9d63" strokeWidth="2"><path d="M4 4h9l3 3v13H4z" /><path d="M8 13h6M8 16h6" /></svg>{V.ingest.uploadName} · PICK A TRANSACTION</div>
-            <div style={S('display:flex;gap:8px;flex-wrap:wrap')}>
-              {V.ingest.uploadChips.map((u, i) => (
-                <button key={i} onClick={u.onClick} style={S(u.style)}>
-                  <span style={S('font-weight:600;font-size:13px;display:block')}>{u.name}</span>
-                  <span style={S("font-family:'IBM Plex Mono',monospace;font-size:10.5px;opacity:.75;display:block;margin-top:2px")}>{u.tag}</span>
-                </button>
-              ))}
-            </div>
-          </div>
+          <TransactionTable 
+            rows={this.state.userTxns} 
+            selected={this.state.sample - this.SAMPLES.length} 
+            onSelect={(i) => this.pickSample(this.SAMPLES.length + i)} 
+            totalCount={this.state.userTxns.length} 
+          />
         )}
 
         {this.renderSamplePicker(V)}
