@@ -188,12 +188,17 @@ async def stream_transaction(tx: TransactionRequest):
             l1_event = {
                 "layer": 1,
                 "status": "pass" if short_circuit else "flag",
-                "chip_label": "Short-circuit" if short_circuit else "No cache hit",
+                "chip_label": "Short-circuit" if short_circuit else ("Cache hit (forced run)" if state.get("memory_match") else "No cache hit"),
                 "detail": (
                     f"MinHash hit on past tx {state.get('memory_match', {}).get('tx_id', 'Unknown')} ({state['memory_similarity_score']:.2f} similarity) · "
                     f"rule hash unchanged → skip L2/L3"
                     if short_circuit else
-                    f"No case memory match · regulation hash: {(state.get('regulation_hash_current') or 'INITIAL')[:12]}… · routing to L2"
+                    (
+                        f"MinHash hit on {state.get('memory_match', {}).get('tx_id', 'Unknown')} ({state['memory_similarity_score']:.2f} sim) · "
+                        f"{'rule hash changed' if state.get('regulation_stale') else 'confidence >= 0.70 requires new STR'} → routing to L2"
+                        if state.get("memory_match") else
+                        f"No case memory match · regulation hash: {(state.get('regulation_hash_current') or 'INITIAL')[:12]}… · routing to L2"
+                    )
                 ),
                 "sub_checks": [],
                 "sub_scores": [],
@@ -309,7 +314,7 @@ async def stream_transaction(tx: TransactionRequest):
                     layer_events.append(l3_event)
                     yield sse({"type": "layer_complete", "event": l3_event})
 
-                    if confidence >= 0.60:
+                    if confidence >= 0.70:
                         l2_evidence = {
                             "primary_category": "C1",
                             "l2_score": state.get("suspicion_score"),
@@ -382,7 +387,7 @@ async def stream_transaction(tx: TransactionRequest):
                     else:
                         l4_event = {
                             "layer": 4, "status": "skip", "chip_label": "Skipped",
-                            "detail": f"Confidence {confidence:.3f} < 0.60 — no auto-file",
+                            "detail": f"Confidence {confidence:.3f} < 0.70 — no auto-file",
                             "sub_checks": [], "sub_scores": [],
                         }
                     layer_events.append(l4_event)

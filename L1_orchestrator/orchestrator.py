@@ -105,20 +105,26 @@ def run_l1_routing(state: dict) -> dict:
     state["regulation_stale"]        = stale
 
     # Step 3 — routing decision
-    if match and not stale:
-        # Memory hit + regulation unchanged → skip L2+L3, go straight to audit
+    cached_conf = match.get("confidence") if match else 0.0
+    if match and not stale and cached_conf < 0.7:
+        # Memory hit + regulation unchanged + no STR needed → skip L2+L3, go straight to audit
         state["short_circuit"] = True
         state["route"]         = "l6_short_circuit"
         state["final_status"]  = "AUDIT_ONLY"
         log.info(
             f"SHORT-CIRCUIT: {tx['tx_id']} matched {match.get('tx_id')} "
             f"(similarity={state['memory_similarity_score']:.3f}, "
-            f"hash_unchanged=True)"
+            f"hash_unchanged=True, conf={cached_conf})"
         )
     else:
         state["short_circuit"] = False
         state["route"]         = "l2"
-        reason = "no memory match" if not match else "regulation hash changed"
+        if not match:
+            reason = "no memory match"
+        elif stale:
+            reason = "regulation hash changed"
+        else:
+            reason = f"memory match but conf {cached_conf} >= 0.7 requires STR"
         log.info(f"FULL PIPELINE: {tx['tx_id']} ({reason})")
 
     # Append L1 audit block
