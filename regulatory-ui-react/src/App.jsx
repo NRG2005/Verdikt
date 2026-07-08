@@ -250,7 +250,9 @@ export default class App extends React.Component {
   fetchReal(idx) {
     const sample = this.allSamples[idx]
     if (!sample) return Promise.resolve()
-    return this.streamPipeline(this.txPayload(sample)).then(result => {
+    if (sample._fetchPromise) return sample._fetchPromise
+    
+    sample._fetchPromise = this.streamPipeline(this.txPayload(sample)).then(result => {
       if (!result) return
       const m = this.mapResult(result)
       // On a short-circuited reportable verdict the live path fires no agent checks; keep the
@@ -262,6 +264,8 @@ export default class App extends React.Component {
       if (m.clearGraph) sample.graphType = null
       sample.live = true
     }).catch(() => { /* backend unreachable — keep the built-in demo data */ })
+    
+    return sample._fetchPromise
   }
 
   // ---------- data ----------
@@ -501,23 +505,29 @@ export default class App extends React.Component {
     this.clearTimers()
     this.setState({ reportProgress: 0, filed: false })
     const idx = this.state.sample
-    if (!this.s.live) {
-      this.fetchReal(idx).then(() => {
-        if (this.state.step === 4 && this.state.sample === idx) this.setState({})
-      })
+    
+    const advance = () => {
+      [12, 32, 55, 74, 90, 100].forEach((p, i) => this.after(350 + i * 340, () => this.setState({ reportProgress: p })))
+      this.after(350 + 6 * 340 + 400, () => this.setState({ filed: true }))
     }
-    [12, 32, 55, 74, 90, 100].forEach((p, i) => this.after(350 + i * 340, () => this.setState({ reportProgress: p })))
-    this.after(350 + 6 * 340 + 400, () => this.setState({ filed: true }))
+
+    this.fetchReal(idx).then(() => {
+      if (this.state.step === 4 && this.state.sample === idx) {
+        this.setState({})
+        advance()
+      }
+    })
   }
 
   startOutcome() {
     this.clearTimers()
     const idx = this.state.sample
-    if (!this.s.live) {
-      this.fetchReal(idx).then(() => {
-        if (this.state.step === 5 && this.state.sample === idx) this.setState({})
-      })
-    }
+    
+    this.fetchReal(idx).then(() => {
+      if (this.state.step === 5 && this.state.sample === idx) {
+        this.setState({})
+      }
+    })
   }
 
   // ---------- graph geometry ----------

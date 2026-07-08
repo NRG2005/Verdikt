@@ -25,6 +25,9 @@ is not present in the retrieved chunks.
 
 CRITICAL INSTRUCTION FOR L2 TRIGGERS:
 If the transaction has an 'l2_triggers_fired' flag (e.g., C1_velocity, structuring), you MUST mathematically assume that the backend already verified the aggregated sums. For example, if a rule states "monthly aggregate exceeds 10 lakhs", and the L2 velocity trigger fired, you must assume the 10 lakh threshold was successfully breached by the customer's history, even if the single transaction amount is smaller. Score the transaction highly (e.g., 0.80+) if the rule conceptually matches the trigger.
+
+CRITICAL INSTRUCTION ON JARGON:
+When writing the "explanation", DO NOT use internal pipeline jargon or abbreviations such as C1, C2, L1, L2, L3, or L4. The final reader of the report will not understand these terms. Instead of saying "L2 trigger C1_velocity fired", write "The transaction history triggered a high-velocity screening alert" or describe the actual behavior. Use clear, professional, plain language to explain the reasoning and the patterns observed.
 """.strip()
 
 
