@@ -839,6 +839,15 @@ if __name__ == "__main__":
 # UPI measure effective 1 Apr 2025. (Per Layer2.pdf C4 citation index.)
 
 C4_DORMANCY_DAYS = 150          # dormant-reactivation floor (clean <= ~5)
+C4_DORMANCY_AMOUNT_RATIO = 1.5  # amount must be >= 1.5x the account's own avg
+                                 # tx to fire -- tuned against data/ground_truth.csv
+                                 # (split=="train" only): a plain dormancy-days
+                                 # trigger with no amount gate fired on every
+                                 # transaction from a dormant account regardless
+                                 # of size, which is not realistic (most dormant
+                                 # accounts are just infrequent shoppers, not
+                                 # fraud victims). 1.5x removed 22/36 train false
+                                 # positives with zero true-positive loss on train.
 C4_NEW_ACCOUNT_AGE_DAYS = 90    # "young account" ceiling
 C4_NEW_ACCOUNT_MIN_AMOUNT = 150_000.0   # high-value floor for a young account
 _C4_MIN_KYC = {"min kyc", "basic", "aadhaar otp", "simplified kyc", "min_kyc"}
@@ -861,10 +870,13 @@ def evaluate_row(row, dl):
     age_days = _c4_num(acc.get("account_age_days"))
     kyc = (acc.get("kyc_status") or "").strip().lower()
     amount = _c4_num(row.get("amount_inr"))
+    avg_amount = _c4_num(acc.get("avg_tx_amount_inr"))
     is_min_kyc = kyc in _C4_MIN_KYC
 
     # --- Dormant reactivation ---
-    if dormancy_days >= C4_DORMANCY_DAYS:
+    if dormancy_days >= C4_DORMANCY_DAYS and (
+        avg_amount <= 0 or amount >= C4_DORMANCY_AMOUNT_RATIO * avg_amount
+    ):
         score = round(min(dormancy_days / 365.0, 1.0), 4)
         return {"fired": True, "score": score, "trigger": "C4_dormancy"}
 

@@ -112,17 +112,47 @@ def query_case_memory(tx: dict) -> dict | None:
 def store_case(state: dict) -> None:
     """
     Saves a completed case to memory so future similar transactions
-    can match against it. Called after a case reaches final_status.
+    can match against it, AND so the L5 review page can list/render it.
+    Called after a case reaches final_status.
     """
+    tx = state.get("tx_payload") or {}
+    confidence = state.get("confidence")
+    # Same single boundary api.py's L4/L5 routing uses: confidence >= 0.70
+    # auto-generates a packet, below that goes to human review. Recomputed
+    # here (not read from state) since there's no single stored
+    # confidence_band field today. (Previously used a 0.50-0.90 band that
+    # didn't match what api.py's live routing actually did -- see api.py's
+    # L4/L5 section for that history.)
+    needs_review = confidence is not None and confidence < 0.70
+
     cases = load_case_memory()
     cases.append({
         "tx_id":                   state["tx_id"],
         "case_id":                 state["case_id"],
-        "feature_set":             build_feature_set(state["tx_payload"]),
+        "feature_set":             build_feature_set(tx),
         "regulation_version_hash": state.get("regulation_hash_current"),
         "final_status":            state.get("final_status") or state.get("verdict"),
-        "confidence":              state.get("confidence"),
+        "confidence":              confidence,
         "str_pdf_url":             state.get("str_pdf_url"),
+        # Dossier fields for the L5 review page (view of the case, not used
+        # by query_case_memory's MinHash matching, which only reads
+        # feature_set above).
+        "sender_name":             tx.get("sender_name", ""),
+        "receiver_name":           tx.get("receiver_name", ""),
+        "amount_inr":              tx.get("amount_inr"),
+        "channel":                 tx.get("channel", ""),
+        "delivery_status":         tx.get("delivery_status", ""),
+        "dispute_reason":          tx.get("dispute_reason", ""),
+        "triggers_fired":          state.get("triggers_fired") or [],
+        "verdict":                 state.get("verdict"),
+        "explanation":             state.get("explanation", ""),
+        "citation_trail":          state.get("citation_trail"),
+        "l4_disposition":          state.get("l4_disposition"),
+        "l4_recommended_action":   state.get("l4_recommended_action"),
+        "needs_review":            needs_review,
+        "reviewer_decision":       state.get("reviewer_decision"),
+        "reviewer_id":             state.get("reviewer_id"),
+        "stored_at":               __import__("datetime").datetime.utcnow().isoformat() + "Z",
     })
     save_case_memory(cases)
     log.info(f"Stored case {state['tx_id']} in memory ({len(cases)} total)")

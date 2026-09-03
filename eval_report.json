@@ -1,0 +1,180 @@
+{
+  "holdout_size": 273,
+  "task_a_proactive_risk_detection": {
+    "tp": 15,
+    "fp": 9,
+    "tn": 239,
+    "fn": 10,
+    "precision": 0.625,
+    "recall": 0.6,
+    "recall_by_fraud_posture": {
+      "subtle_drain": {
+        "caught": 0,
+        "total": 1,
+        "recall": 0.0
+      },
+      "subtle_blend": {
+        "caught": 0,
+        "total": 9,
+        "recall": 0.0
+      },
+      "obvious": {
+        "caught": 15,
+        "total": 15,
+        "recall": 1.0
+      }
+    },
+    "fraud_amount_inr_caught": 359243.59,
+    "fraud_amount_inr_missed": 184411.81,
+    "false_positive_review_cost_inr": 1350.0,
+    "review_cost_assumption_inr_per_case": 150.0,
+    "exceptions": [
+      {
+        "tx_id": "TX000021",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 111736.96
+      },
+      {
+        "tx_id": "TX000031",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 11026.29
+      },
+      {
+        "tx_id": "TX000072",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 7992.29
+      },
+      {
+        "tx_id": "TX000082",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 5104.51
+      },
+      {
+        "tx_id": "TX000132",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 2471.55
+      },
+      {
+        "tx_id": "TX000150",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 17354.4
+      },
+      {
+        "tx_id": "TX000241",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 13843.92
+      },
+      {
+        "tx_id": "TX000311",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 3046.19
+      },
+      {
+        "tx_id": "TX000462",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 6291.35
+      },
+      {
+        "tx_id": "TX000560",
+        "task": "A",
+        "label": "true_fraud",
+        "reason": "true_fraud not caught by any proactive detector",
+        "amount_inr": 5544.35
+      }
+    ],
+    "note": "friendly_fraud is intentionally excluded from this task's target: by construction it has no transaction-time anomaly (the purchase legitimately happened), so it is not detectable pre-dispute. See Task B for how it's actually caught."
+  },
+  "task_b_dispute_evidence_classification": {
+    "n_disputed": 68,
+    "correct": 61,
+    "accuracy": 0.8970588235294118,
+    "confusion_matrix": {
+      "CONTEST": {
+        "CONTEST": 20,
+        "ESCALATE": 1
+      },
+      "CONCEDE": {
+        "CONCEDE": 38,
+        "CONTEST": 6,
+        "ESCALATE": 3
+      }
+    },
+    "misclassified_dispute_amount_inr": 161387.79,
+    "exceptions": [
+      {
+        "tx_id": "TX000241",
+        "task": "B",
+        "label": "true_fraud",
+        "correct_action": "CONCEDE",
+        "system_recommended": "CONTEST_WITH_EVIDENCE",
+        "amount_inr": 13843.92
+      },
+      {
+        "tx_id": "TX000302",
+        "task": "B",
+        "label": "true_fraud",
+        "correct_action": "CONCEDE",
+        "system_recommended": "CONTEST_WITH_EVIDENCE",
+        "amount_inr": 11630.0
+      },
+      {
+        "tx_id": "TX000332",
+        "task": "B",
+        "label": "friendly_fraud",
+        "correct_action": "CONTEST_WITH_EVIDENCE",
+        "system_recommended": "ESCALATE_TO_REVIEW",
+        "amount_inr": 15487.19
+      },
+      {
+        "tx_id": "TX000590",
+        "task": "B",
+        "label": "true_fraud",
+        "correct_action": "CONCEDE",
+        "system_recommended": "CONTEST_WITH_EVIDENCE",
+        "amount_inr": 23713.01
+      },
+      {
+        "tx_id": "TX000622",
+        "task": "B",
+        "label": "true_fraud",
+        "correct_action": "CONCEDE",
+        "system_recommended": "CONTEST_WITH_EVIDENCE",
+        "amount_inr": 31318.12
+      },
+      {
+        "tx_id": "TX000752",
+        "task": "B",
+        "label": "true_fraud",
+        "correct_action": "CONCEDE",
+        "system_recommended": "CONTEST_WITH_EVIDENCE",
+        "amount_inr": 35905.21
+      },
+      {
+        "tx_id": "TX000870",
+        "task": "B",
+        "label": "true_fraud",
+        "correct_action": "CONCEDE",
+        "system_recommended": "CONTEST_WITH_EVIDENCE",
+        "amount_inr": 29490.34
+      }
+    ]
+  }
+}

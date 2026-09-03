@@ -1,18 +1,34 @@
 #!/usr/bin/env python3
 """
-L4 - Report Generator (FIU-IND goAML TRF STR)
-=============================================
+L4 - Report Generator (Dispute Evidence Packet)
+================================================
+
+Track 02 retrofit. Same engine as the AML pipeline's STR generator (constrained
+SLM mapping -> deterministic serializer -> schema+rule validation -> repair
+loop), retargeted from a goAML FIU-IND STR onto a merchant-facing Dispute
+Evidence Packet. See DisputeEvidencePacket_POC.xsd for why this is an
+original POC schema rather than a reconstruction of a real network format.
 
 Pipeline position:  L3 (verdict) --> L4 --> L6 (audit) | L5 (escalate)
 
 What this layer does, end to end:
   1. SLM maps L3's verdict + L2 evidence into a CONSTRAINED JSON object
      (enums locked to lists pulled from the XSD - SLM cannot invent codes).
+     Two fields that used to be SLM-guessed in the AML version are now
+     RULE-derived instead, because they're facts, not judgment calls:
+       - DisputeReasonCategory: comes directly from the cardholder's own
+         stated dispute reason (the issuing bank assigns this when the
+         dispute is filed - it isn't something to infer).
+       - DeliveryStatus: comes directly from the transaction's own
+         delivery_status field (the merchant's own fulfilment record).
+     The SLM is still responsible for RecommendedAction, EvidenceTier, and
+     EvidenceSummary - genuine synthesis/judgment over L2's evidence signal
+     and L3's citation trail, hinted (not dictated) by L2's C5 trigger.
   2. Deterministic serializer turns that JSON + static/rule/sysdate fields
-     into a TransactionBasedReport STR XML. SLM never authors XML.
-  3. validate_str runs two real FIU layers:
-        XSV  - XML Schema Validation against TransactionBasedReport_POC.xsd
-        PRV  - Preliminary Rule Validation (the named FIU rules, with severity)
+     into a DisputeEvidencePacket XML. SLM never authors XML.
+  3. validate_str runs two layers:
+        XSV  - XML Schema Validation against DisputeEvidencePacket_POC.xsd
+        PRV  - Preliminary Rule Validation (named rules, with severity)
   4. Loop: on schema/fatal errors, feed the SPECIFIC errors back to the SLM,
      which repairs only the broken fields. Max 3 attempts.
         success                    -> emit XML for L6 + (reg_hash, json) for L1
@@ -24,17 +40,11 @@ Design guarantee (why the loop protects rather than rubber-stamps):
   - XSV catches structure/type/enum errors
   - PRV catches mandatory/sufficiency/consistency errors (named, typed)
   - only SCHEMA + FATAL must be fixed; NON-FATAL + PROBABLE may pass
-    (mirrors real FIU-IND: fatal -> rejection, non-fatal/probable -> accepted)
 
 Run:  python3 l4_report_generator.py
 Requires: lxml   (pip install lxml)
 Optional: Ollama running Phi-4-mini for the live SLM; falls back to a
           deterministic mock mapper if Ollama is unavailable.
-
-NOTE ON FIDELITY: TransactionBasedReport_POC.xsd is reconstructed from the
-public Reporting Format Guide v2.2 structure. Enum *code values* are POC
-placeholders - the real FIU Lookup Master codes are gated behind FINnet login.
-Swap the .xsd + ENUM_LOOKUPS for the real values; nothing else changes.
 """
 
 import os
@@ -44,25 +54,30 @@ import hashlib
 import datetime
 from lxml import etree
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from L2_transaction_monitor.detectors.c5_fema_lrs import (
+    recommended_action as c5_recommended_action,
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-XSD_PATH = os.path.join(HERE, "TransactionBasedReport_POC.xsd")
+XSD_PATH = os.path.join(HERE, "DisputeEvidencePacket_POC.xsd")
 
 # ----------------------------------------------------------------------------
-# Static POC config - the reporting entity itself (mocked, never SLM-decided)
+# Static POC config - the responding merchant itself (mocked, never SLM-decided)
 # ----------------------------------------------------------------------------
-REPORTING_ENTITY = {
-    "EntityName": "Demo Fintech Pvt Ltd",
-    "EntityRefNum": "POC-RE-0001",     # real value = FIUREID after registration
+RESPONDING_MERCHANT = {
+    "MerchantName": "Demo Fintech Pvt Ltd",
+    "MerchantRefNum": "POC-MER-0001",
 }
-PRINCIPAL_OFFICER = {
-    "Name": "POC Principal Officer",
-    "Email": "po@demofintech.example",
+CASE_OFFICER = {
+    "Name": "POC Dispute Ops Officer",
+    "Email": "disputeops@demofintech.example",
 }
-DATA_STRUCTURE_VERSION = "2.0"          # POC; confirm against real XSD
+DATA_STRUCTURE_VERSION = "1.0"          # POC; this schema's own version, not FIU's
 
 # ----------------------------------------------------------------------------
 # Enum lookups - pulled from the XSD at runtime, injected into the SLM prompt.
-# This is the ONLY place enum codes live. Replace with real Lookup Master codes
+# This is the ONLY place enum codes live. Replace with a real network's codes
 # by swapping the XSD; this dict is auto-derived from it below.
 # ----------------------------------------------------------------------------
 def load_enums_from_xsd(xsd_path):
@@ -80,23 +95,50 @@ def load_enums_from_xsd(xsd_path):
 
 ENUM_LOOKUPS = load_enums_from_xsd(XSD_PATH)
 
-# Which enum list governs each SLM-chosen field
+# Which enum list governs each SLM-chosen field (DisputeReasonCategory and
+# DeliveryStatus are RULE-derived below, not SLM-chosen -- see module docstring)
 SLM_ENUM_FIELDS = {
-    "suspicion_indicator": "SuspicionIndicatorEnum_POC",
-    "funds_code": "FundsCodeEnum_POC",
-    "transaction_mode": "TransactionModeEnum_POC",
+    "recommended_action": "RecommendedActionEnum_POC",
+    "evidence_tier": "EvidenceTierEnum_POC",
 }
 
-# Map L2 primary_category (C1-C6) -> suspicion indicator enum.
-# This is a deterministic hint the SLM uses; it still must emit a valid enum.
-CATEGORY_TO_INDICATOR = {
-    "C1": "STRUCTURING",
-    "C2": "SANCTIONS_MATCH",
-    "C3": "NETWORK_FLOW",
-    "C4": "ACCOUNT_RISK",
-    "C5": "CROSS_BORDER_LRS",
-    "C6": "GEO_ANOMALY",
+# RULE: the cardholder's own stated dispute reason determines the network
+# category. This mirrors dispute-reasoncodes-poc-001 in the corpus.
+DISPUTE_REASON_TO_CATEGORY = {
+    "UNAUTHORIZED_TRANSACTION": "FRAUD",
+    "ITEM_NOT_RECEIVED_CLAIM": "CONSUMER_DISPUTE",
+    "UNRECOGNIZED_CHARGE_CLAIM": "CONSUMER_DISPUTE",
+    "ITEM_NOT_RECEIVED_GENUINE": "CONSUMER_DISPUTE",
+    "DUPLICATE_CHARGE": "PROCESSING_ERROR",
+    "WRONG_AMOUNT": "PROCESSING_ERROR",
 }
+
+# RULE: delivery_status -> the schema's DeliveryStatusEnum_POC value.
+DELIVERY_STATUS_MAP = {
+    "DELIVERED": "DELIVERED",
+    "IN_TRANSIT": "IN_TRANSIT",
+    "NOT_DELIVERED": "NOT_DELIVERED",
+    "RETURNED": "RETURNED",
+    "NOT_APPLICABLE": "NOT_APPLICABLE",
+}
+
+# Hint the SLM with L2's own C5 recommendation (see c5_fema_lrs.py) and the
+# evidence tier that trigger implies, per compelling-evidence-poc-002's
+# hierarchy. The SLM still must emit a valid enum -- this is a hint, not a
+# substitute for the constraint.
+C5_TRIGGER_TO_EVIDENCE_TIER = {
+    "C5_evidence_favors_contest": "TIER1_CONFIRMED_DELIVERY",
+    "C5_evidence_ambiguous": "TIER2_DEVICE_IP_MATCH",
+    "C5_evidence_favors_concede": "TIER3_MERCHANT_RECORDS_ONLY",
+}
+
+
+def _c5_trigger_from_evidence(l2_evidence):
+    """Find the C5 trigger (if any) among L2's fired triggers."""
+    for t in l2_evidence.get("l2_triggers") or []:
+        if isinstance(t, str) and t.startswith("C5_"):
+            return t
+    return None
 
 
 # ============================================================================
@@ -119,25 +161,30 @@ def slm_map(l3_verdict, l2_evidence, transaction, repair_errors=None):
 
 def _build_prompt(l3_verdict, l2_evidence, transaction, repair_errors):
     enum_block = {f: ENUM_LOOKUPS[SLM_ENUM_FIELDS[f]] for f in SLM_ENUM_FIELDS}
+    c5_trigger = _c5_trigger_from_evidence(l2_evidence)
     instructions = (
-        "You map an Indian-fintech compliance verdict into a constrained JSON "
-        "object for a FIU-IND STR. Output ONLY JSON, no prose, no markdown.\n"
+        "You map a chargeback-response verdict into a constrained JSON "
+        "object for a Dispute Evidence Packet. Output ONLY JSON, no prose, no markdown.\n"
         "Every *_enum field MUST be exactly one value from the provided lists.\n"
         "Do not invent fields. Do not output XML.\n"
+        "IMPORTANT: output_contract below shows the REQUIRED SHAPE, not literal "
+        "values. Every string wrapped in <angle brackets> is a placeholder "
+        "describing what belongs there -- replace it with the actual real "
+        "value from l3_verdict/l2_evidence/transaction. Never output a string "
+        "that starts with '<' in your answer.\n"
     )
     contract = {
-        "main_person_name": "<principal suspect name>",
-        "suspicion_indicator": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('suspicion_indicator', [])) + "> (Hint: C1 maps to STRUCTURING, C2 to SANCTIONS_MATCH, C3 to NETWORK_FLOW, C4 to ACCOUNT_RISK, C5 to CROSS_BORDER_LRS, C6 to GEO_ANOMALY)",
-        "grounds_of_suspicion": "<short narrative from verdict + clause>",
-        "funds_code": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('funds_code', [])) + ">",
-        "transaction_mode": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('transaction_mode', [])) + ">",
-        "customer": {"role": "SENDER|RECEIVER", "name": "", "pan": "", "dob": ""},
-        "related_person": {"role": "SENDER|RECEIVER", "name": "", "pan": "", "dob": ""},
+        "principal_party_name": "<cardholder name>",
+        "recommended_action": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('recommended_action', [])) + "> (Hint: L2's own C5 evidence-direction signal for this case is '" + str(c5_trigger) + "')",
+        "evidence_tier": "<MUST BE EXACTLY ONE OF: " + ", ".join(enum_block.get('evidence_tier', [])) + "> (Hint: " + str(C5_TRIGGER_TO_EVIDENCE_TIER.get(c5_trigger, "TIER3_MERCHANT_RECORDS_ONLY")) + ")",
+        "evidence_summary": "<short narrative synthesizing the L3 explanation + citation, in plain language>",
+        "cardholder": {"role": "CARDHOLDER", "name": "", "pan": "", "dob": ""},
+        "merchant_party": {"role": "MERCHANT", "name": ""},
     }
     payload = {
         "instructions": instructions,
         "allowed_enums": enum_block,
-        "category_mapping_hint": CATEGORY_TO_INDICATOR,
+        "c5_trigger_hint": c5_trigger,
         "output_contract": contract,
         "l3_verdict": l3_verdict,
         "l2_evidence": l2_evidence,
@@ -169,49 +216,42 @@ def _slm_map_ollama(l3_verdict, l2_evidence, transaction, repair_errors):
 def _slm_map_mock(l3_verdict, l2_evidence, transaction, repair_errors):
     """Deterministic stand-in. Produces the same contract the live SLM would,
     using the L2/L3 fields directly. On repair, nudges the named field."""
-    category = l2_evidence.get("primary_category", "C1")
-    indicator = CATEGORY_TO_INDICATOR.get(category, "STRUCTURING")
+    c5_trigger = _c5_trigger_from_evidence(l2_evidence)
+    action = c5_recommended_action(c5_trigger) if c5_trigger else "ESCALATE_TO_REVIEW"
+    if action not in ENUM_LOOKUPS["RecommendedActionEnum_POC"]:
+        action = "ESCALATE_TO_REVIEW"
+    tier = C5_TRIGGER_TO_EVIDENCE_TIER.get(c5_trigger, "TIER3_MERCHANT_RECORDS_ONLY")
 
     sender = l2_evidence.get("sender", {})
     receiver = l2_evidence.get("receiver", {})
 
-    clause_no = (l3_verdict.get("clause_no") or "").strip()
-    clause_txt = (l3_verdict.get("clause") or "").strip()
     explanation = (l3_verdict.get("explanation") or "").strip()
     citation_prose = (l3_verdict.get("citation") or "").strip()
-    # GroundsOfSuspicion = the prose justification (what L3 reasoned), optionally
-    # anchored to the clause. Leave blank only if L3 gave nothing, so the FATAL
-    # fires and the repair loop is exercised.
+    clause_no = (l3_verdict.get("clause_no") or "").strip()
+    clause_txt = (l3_verdict.get("clause") or "").strip()
     if explanation:
-        grounds = explanation
+        summary = explanation
     elif citation_prose:
-        grounds = citation_prose
+        summary = citation_prose
     elif clause_no or clause_txt:
-        grounds = f"Applicable provision: {clause_no} {clause_txt}".strip()
+        summary = f"Applicable guidance: {clause_no} {clause_txt}".strip()
     else:
-        grounds = ""
-
-    mode = transaction.get("channel", "UPI")
-    if mode not in ENUM_LOOKUPS["TransactionModeEnum_POC"]:
-        mode = "UPI"
+        summary = ""
 
     out = {
-        "main_person_name": sender.get("name", "UNKNOWN"),
-        "suspicion_indicator": indicator,
-        "grounds_of_suspicion": grounds,
-        "funds_code": "K",  # placeholder default; real mapping from Lookup Master
-        "transaction_mode": mode,
-        "customer": {
-            "role": "SENDER",
+        "principal_party_name": sender.get("name", "UNKNOWN"),
+        "recommended_action": action,
+        "evidence_tier": tier,
+        "evidence_summary": summary,
+        "cardholder": {
+            "role": "CARDHOLDER",
             "name": sender.get("name", ""),
             "pan": sender.get("pan", ""),
             "dob": sender.get("dob", ""),
         },
-        "related_person": {
-            "role": "RECEIVER",
+        "merchant_party": {
+            "role": "MERCHANT",
             "name": receiver.get("name", ""),
-            "pan": receiver.get("pan", ""),
-            "dob": receiver.get("dob", ""),
         },
     }
 
@@ -219,24 +259,24 @@ def _slm_map_mock(l3_verdict, l2_evidence, transaction, repair_errors):
     if repair_errors:
         for err in repair_errors:
             field = err.get("field", "")
-            if "GroundsOfSuspicion" in field and not out["grounds_of_suspicion"]:
-                out["grounds_of_suspicion"] = (
-                    "Suspicious pattern flagged by L2 detection; "
-                    "regulation interpretation pending full clause text.")
-            if "MainPersonName" in field or "Name" in field:
-                if not out["customer"]["name"]:
-                    out["customer"]["name"] = "UNKNOWN PARTY"
-                if out["main_person_name"] in ("", "UNKNOWN"):
-                    out["main_person_name"] = out["customer"]["name"] or "UNKNOWN PARTY"
+            if "EvidenceSummary" in field and not out["evidence_summary"]:
+                out["evidence_summary"] = (
+                    "Dispute flagged by upstream detection; regulation "
+                    "interpretation pending full citation text.")
+            if "PrincipalPartyName" in field or "Name" in field:
+                if not out["cardholder"]["name"]:
+                    out["cardholder"]["name"] = "UNKNOWN PARTY"
+                if out["principal_party_name"] in ("", "UNKNOWN"):
+                    out["principal_party_name"] = out["cardholder"]["name"] or "UNKNOWN PARTY"
     return out
 
 
 # ============================================================================
-# STEP 2 - deterministic serializer (constrained JSON -> TRF XML)
+# STEP 2 - deterministic serializer (constrained JSON -> Dispute Packet XML)
 # ============================================================================
 def serialize(slm_json, l3_verdict, transaction):
-    """Merge SLM JSON with RULE/STATIC/SYSDATE/L0 fields into TRF STR XML.
-    Pure assembly - no model, no invention."""
+    """Merge SLM JSON with RULE/STATIC/SYSDATE/L0 fields into the Dispute
+    Evidence Packet XML. Pure assembly - no model, no invention."""
     now = datetime.datetime.now()
     batch_date = now.strftime("%Y-%m-%d")
     batch_number = now.strftime("%Y%m%d%H%M%S")[:11]   # 11-char unique series
@@ -252,48 +292,64 @@ def serialize(slm_json, l3_verdict, transaction):
     bh = el(batch, "BatchHeader")
     el(bh, "DataStructureVersion", DATA_STRUCTURE_VERSION)
 
-    el(batch, "ReportType", "STR")                      # RULE
+    el(batch, "PacketType", "DISPUTE_RESPONSE")          # RULE
 
-    re_el = el(batch, "ReportingEntity")                # STATIC
-    el(re_el, "EntityName", REPORTING_ENTITY["EntityName"])
-    el(re_el, "EntityRefNum", REPORTING_ENTITY["EntityRefNum"])
+    rm = el(batch, "RespondingMerchant")                 # STATIC
+    el(rm, "MerchantName", RESPONDING_MERCHANT["MerchantName"])
+    el(rm, "MerchantRefNum", RESPONDING_MERCHANT["MerchantRefNum"])
 
-    po = el(batch, "PrincipalOfficer")                  # STATIC
-    el(po, "Name", PRINCIPAL_OFFICER["Name"])
-    el(po, "Email", PRINCIPAL_OFFICER["Email"])
+    co = el(batch, "CaseOfficer")                        # STATIC
+    el(co, "Name", CASE_OFFICER["Name"])
+    el(co, "Email", CASE_OFFICER["Email"])
 
     bd = el(batch, "BatchDetails")
-    el(bd, "BatchNumber", batch_number)                 # SYSDATE-derived
-    el(bd, "BatchDate", batch_date)                     # SYSDATE
-    el(bd, "BatchType", "N")                            # RULE (new report)
-    el(bd, "MonthOfReport", "NA")                       # RULE - STR has no month
-    el(bd, "YearOfReport", "NA")                        # RULE - STR (POC; verify)
+    el(bd, "BatchNumber", batch_number)                  # SYSDATE-derived
+    el(bd, "BatchDate", batch_date)                      # SYSDATE
+    el(bd, "ResponseType", "N")                          # RULE (new response)
 
-    report = el(batch, "Report")
-    el(report, "ReportSerialNum", "1")                  # RULE (single-STR POC)
-    
-    # Use .get() defensively against SLM JSON drift
-    main_person = slm_json.get("main_person_name", "")
-    if not main_person and "customer" in slm_json:
-        main_person = slm_json["customer"].get("name", "")
-    if not main_person or len(main_person) < 2:
-        # Final fallback to l2_evidence or transaction data to avoid SufficiencyLengthFatal
-        main_person = transaction.get("sender_name", "") or transaction.get("receiver_name", "") or "Unknown Suspect"
+    case = el(batch, "Case")
+    el(case, "CaseSerialNum", "1")                       # RULE (single-case POC)
 
-    el(report, "MainPersonName", main_person)
+    def _clean(v):
+        """A raw SLM string, or '' if it's blank/a leaked placeholder."""
+        v = (v or "").strip()
+        return "" if v.startswith("<") else v
 
-    sd = el(report, "SuspicionDetails")
-    
-    suspicion_ind = slm_json.get("suspicion_indicator") or "STRUCTURING"
-    if suspicion_ind.startswith("<"): suspicion_ind = "STRUCTURING"
-    el(sd, "SuspicionType", suspicion_ind)
-    
-    grounds = slm_json.get("grounds_of_suspicion") or "Suspicious activity detected"
-    if grounds.startswith("<"): grounds = "Suspicious activity detected"
-    el(sd, "GroundsOfSuspicion", grounds)
+    # Use .get() defensively against SLM JSON drift, and against the SLM
+    # literally echoing back a placeholder instead of filling it in (a real
+    # failure mode observed with phi4-mini on this field specifically).
+    principal_name = _clean(slm_json.get("principal_party_name"))
+    if not principal_name and "cardholder" in slm_json:
+        principal_name = _clean(slm_json["cardholder"].get("name"))
+    if not principal_name or len(principal_name) < 2:
+        principal_name = transaction.get("sender_name", "") or transaction.get("receiver_name", "") or "Unknown Cardholder"
 
-    # RegulationCitation = the VERIFIABLE provision (clause_no + clause text),
-    # NOT the prose justification. This keeps the STR's legal basis auditable.
+    el(case, "PrincipalPartyName", principal_name)
+
+    ea = el(case, "EvidenceAssessment")
+
+    action = slm_json.get("recommended_action") or "ESCALATE_TO_REVIEW"
+    if action.startswith("<") or action not in ENUM_LOOKUPS["RecommendedActionEnum_POC"]:
+        action = "ESCALATE_TO_REVIEW"
+    el(ea, "RecommendedAction", action)
+
+    # DisputeReasonCategory: RULE, from the transaction's own dispute_reason.
+    dispute_reason = transaction.get("dispute_reason", "")
+    category = DISPUTE_REASON_TO_CATEGORY.get(dispute_reason, "CONSUMER_DISPUTE")
+    el(ea, "DisputeReasonCategory", category)
+
+    tier = slm_json.get("evidence_tier") or "TIER3_MERCHANT_RECORDS_ONLY"
+    if tier.startswith("<") or tier not in ENUM_LOOKUPS["EvidenceTierEnum_POC"]:
+        tier = "TIER3_MERCHANT_RECORDS_ONLY"
+    el(ea, "EvidenceTier", tier)
+
+    summary = slm_json.get("evidence_summary") or "Evidence under review"
+    if summary.startswith("<"):
+        summary = "Evidence under review"
+    el(ea, "EvidenceSummary", summary)
+
+    # RuleCitation = the VERIFIABLE cited guidance (rule designation + excerpt),
+    # NOT the prose justification. Keeps the packet's basis auditable.
     citation_trail = l3_verdict.get("citation_trail", [])
     if isinstance(citation_trail, list) and len(citation_trail) > 0:
         lines = []
@@ -304,59 +360,42 @@ def serialize(slm_json, l3_verdict, transaction):
                 desig = c.get("rule_designation", c.get("clause_no", ""))
                 excerpt = c.get("excerpt", c.get("clause", ""))
                 lines.append(f"Rule {desig}: {excerpt}".strip())
-        citation_value = "\n".join(lines)
-        el(sd, "RegulationCitation", citation_value)
+        el(ea, "RuleCitation", "\n".join(lines))
     else:
-        el(sd, "RegulationCitation", "N/A - Regulatory match generated by L3 engine")
+        el(ea, "RuleCitation", "N/A - no matching guidance retrieved")
 
-    el(sd, "DateOfSuspicion", batch_date)               # SYSDATE
+    el(ea, "DateOfAssessment", batch_date)                # SYSDATE
 
-    txn = el(report, "Transaction")
-    el(txn, "TransactionNumber", transaction.get("tx_id", ""))      # L0
-    
-    # Format date to YYYY-MM-DD to satisfy XSD pattern \d{4}-\d{2}-\d{2}
-    txn_date_raw = transaction.get("timestamp", batch_date)
+    txn = el(case, "Transaction")
+    el(txn, "TransactionNumber", transaction.get("tx_id", ""))       # L0
+    txn_date_raw = transaction.get("timestamp") or transaction.get("date", batch_date)
     txn_date_fmt = txn_date_raw[:10] if txn_date_raw else batch_date
-    el(txn, "TransactionDate", txn_date_fmt) # L0 (txn date!)
-    
-    mode = slm_json.get("transaction_mode") or "UPI"
-    if mode.startswith("<"): mode = "UPI"
-    el(txn, "TransactionMode", mode)        # SLM (enum)
-    
-    el(txn, "DebitCredit", "D")                          # RULE (sender debit)
-    el(txn, "Amount", str(transaction.get("amount_inr", transaction.get("amount", "0"))))    # L0
-    el(txn, "Currency", transaction.get("currency", "INR"))  # L0
-    
-    funds = slm_json.get("funds_code") or "K"
-    if funds.startswith("<"): funds = "K"
-    el(txn, "FundsCode", funds)         # SLM (enum)
+    el(txn, "TransactionDate", txn_date_fmt)              # L0
 
-    cust = el(txn, "CustomerDetails")                    # SLM-routed party
-    c = slm_json.get("customer", {})
-    
-    c_role = c.get("role", "SENDER")
-    if "SENDER" in c_role and "RECEIVER" in c_role: c_role = "SENDER"
-    el(cust, "Role", c_role)
-    
-    el(cust, "Name", c.get("name", ""))
-    if c.get("pan"):
+    delivery_status = DELIVERY_STATUS_MAP.get(
+        transaction.get("delivery_status", ""), "NOT_APPLICABLE"
+    )
+    el(txn, "DeliveryStatus", delivery_status)            # RULE, from L0 fact
+
+    el(txn, "DebitCredit", "D")                           # RULE (cardholder debit)
+    el(txn, "Amount", str(transaction.get("amount_inr", transaction.get("amount", "0"))))  # L0
+    el(txn, "Currency", transaction.get("currency", "INR"))  # L0
+
+    cust = el(txn, "CardholderDetails")                    # SLM-routed party
+    c = slm_json.get("cardholder", {})
+    el(cust, "Role", "CARDHOLDER")
+    el(cust, "Name", _clean(c.get("name")) or principal_name)
+    if _clean(c.get("pan")):
         el(cust, "PAN", c["pan"])
-    if c.get("dob"):
+    if _clean(c.get("dob")):
         el(cust, "DOB", c["dob"])
 
-    rp = slm_json.get("related_person")                 # SLM-routed counterparty
-    if rp and rp.get("name"):
-        rpe = el(report, "RelatedPersons")
-        
-        rp_role = rp.get("role", "RECEIVER")
-        if "SENDER" in rp_role and "RECEIVER" in rp_role: rp_role = "RECEIVER"
-        el(rpe, "Role", rp_role)
-        
-        el(rpe, "Name", rp.get("name", ""))
-        if rp.get("pan"):
-            el(rpe, "PAN", rp["pan"])
-        if rp.get("dob"):
-            el(rpe, "DOB", rp["dob"])
+    mp = slm_json.get("merchant_party")                    # SLM-routed counterparty
+    mp_name = _clean(mp.get("name")) if mp else ""
+    if mp_name:
+        rpe = el(case, "RelatedParties")
+        el(rpe, "Role", "MERCHANT")
+        el(rpe, "Name", mp_name)
 
     return etree.tostring(batch, pretty_print=True, xml_declaration=True,
                           encoding="UTF-8").decode()
@@ -365,7 +404,6 @@ def serialize(slm_json, l3_verdict, transaction):
 # ============================================================================
 # STEP 3 - validate_str  (XSV + PRV)
 # ============================================================================
-# PRV severities, verbatim from the Reporting Format Guide / RVU User Guide.
 FATAL_RULES = {"MandatoryValueFatal", "SufficiencyLengthFatal", "ConsistencySum"}
 NONFATAL_RULES = {"MandatoryValueNonFatal", "SufficiencyElementNonFatal",
                   "SufficiencyLengthNonFatal", "ConsistencyValue"}
@@ -375,7 +413,7 @@ PROBABLE_RULES = {"ErrorProbablityHigh", "ErrorProbablityMedium", "ErrorProbabli
 def validate_str(xml_string):
     """Returns {valid, must_fix[], warnings[]}.
     must_fix = schema errors + fatal PRV errors (block auto-file).
-    warnings = non-fatal + probable (do NOT block - mirrors real FIU-IND)."""
+    warnings = non-fatal + probable (do NOT block)."""
     schema_errors = _xsv(xml_string)
     fatal, nonfatal, probable = _prv(xml_string)
 
@@ -391,7 +429,7 @@ def validate_str(xml_string):
 
 
 def _xsv(xml_string):
-    """XML Schema Validation. Returns errors with line + field, like the RVU."""
+    """XML Schema Validation. Returns errors with line + field."""
     try:
         schema = etree.XMLSchema(etree.parse(XSD_PATH))
         doc = etree.fromstring(xml_string.encode())
@@ -408,7 +446,7 @@ def _xsv(xml_string):
 
 
 def _prv(xml_string):
-    """Preliminary Rule Validation - the named FIU rules, implemented.
+    """Preliminary rule validation - the named rules, implemented.
     Returns (fatal, nonfatal, probable) lists."""
     fatal, nonfatal, probable = [], [], []
     try:
@@ -420,40 +458,48 @@ def _prv(xml_string):
         n = doc.find(path)
         return (n.text or "").strip() if n is not None else None
 
-    # MandatoryValueFatal: grounds of suspicion must not be blank (STR core)
-    grounds = txt(".//SuspicionDetails/GroundsOfSuspicion")
-    if not grounds:
+    # MandatoryValueFatal: evidence summary must not be blank (packet core)
+    summary = txt(".//EvidenceAssessment/EvidenceSummary")
+    if not summary:
         fatal.append({"rule": "MandatoryValueFatal",
-                      "field": ".//SuspicionDetails/GroundsOfSuspicion",
-                      "message": "Grounds of suspicion must not be blank"})
+                      "field": ".//EvidenceAssessment/EvidenceSummary",
+                      "message": "Evidence summary must not be blank"})
 
-    # SufficiencyLengthFatal: main person name must be >= 2 chars
-    mpn = txt(".//Report/MainPersonName")
-    if mpn is not None and len(mpn) < 2:
+    # SufficiencyLengthFatal: principal party name must be >= 2 chars
+    ppn = txt(".//Case/PrincipalPartyName")
+    if ppn is not None and len(ppn) < 2:
         fatal.append({"rule": "SufficiencyLengthFatal",
-                      "field": ".//Report/MainPersonName",
-                      "message": "Main person name too short"})
+                      "field": ".//Case/PrincipalPartyName",
+                      "message": "Principal party name too short"})
 
-    # ConsistencySum: report total must equal sum of transaction amounts.
-    # (single-txn POC: trivially holds; rule wired for multi-txn batches)
-    amounts = [float(a.text) for a in doc.findall(".//Transaction/Amount")
-               if a.text and a.text.replace(".", "", 1).isdigit()]
-    # (no separate ReportTotal element in POC schema; placeholder for multi-txn)
+    # ConsistencyValue: a CONTEST_WITH_EVIDENCE recommendation with a
+    # NOT_DELIVERED/RETURNED delivery status contradicts itself - the
+    # evidence-hierarchy corpus explicitly says confirmed delivery is what
+    # makes a contest defensible.
+    action = txt(".//EvidenceAssessment/RecommendedAction")
+    delivery = txt(".//Transaction/DeliveryStatus")
+    if action == "CONTEST_WITH_EVIDENCE" and delivery in ("NOT_DELIVERED", "RETURNED"):
+        nonfatal.append({"rule": "ConsistencyValue",
+                         "field": ".//EvidenceAssessment/RecommendedAction",
+                         "message": "Contest recommended but delivery status does not support it (data quality)"})
 
-    # MandatoryValueNonFatal: PAN of customer should not be blank (warning)
-    pan = txt(".//CustomerDetails/PAN")
+    # MandatoryValueNonFatal: cardholder PAN should not be blank (warning)
+    pan = txt(".//CardholderDetails/PAN")
     if not pan:
         nonfatal.append({"rule": "MandatoryValueNonFatal",
-                         "field": ".//CustomerDetails/PAN",
-                         "message": "Customer PAN is blank (data quality)"})
+                         "field": ".//CardholderDetails/PAN",
+                         "message": "Cardholder PAN is blank (data quality)"})
 
-    # SufficiencyElementNonFatal: at least one related person recommended
-    if doc.find(".//RelatedPersons") is None:
+    # SufficiencyElementNonFatal: the merchant party is recommended
+    if doc.find(".//RelatedParties") is None:
         nonfatal.append({"rule": "SufficiencyElementNonFatal",
-                         "field": ".//RelatedPersons",
-                         "message": "No counterparty included (data quality)"})
+                         "field": ".//RelatedParties",
+                         "message": "No merchant party included (data quality)"})
 
-    # ErrorProbablityLow: same amount appearing is only a probable signal
+    # ErrorProbablityLow: same amount appearing across multiple transactions
+    # in a batch is only a probable signal (wired for multi-case batches)
+    amounts = [float(a.text) for a in doc.findall(".//Transaction/Amount")
+               if a.text and a.text.replace(".", "", 1).isdigit()]
     if len(amounts) > 1 and len(set(amounts)) == 1:
         probable.append({"rule": "ErrorProbablityLow",
                          "field": ".//Transaction/Amount",
@@ -537,7 +583,7 @@ def run_l4(l3_verdict, l2_evidence, transaction):
         "disposition": "ESCALATE_L5",
         "attempts": MAX_ATTEMPTS,
         "attempts_log": attempts_log,
-        "reason": "Could not produce a schema+fatal-clean STR in 3 attempts",
+        "reason": "Could not produce a schema+fatal-clean Dispute Evidence Packet in 3 attempts",
         "to_L5": {
             "l3_verdict": l3_verdict,
             "l2_evidence": l2_evidence,
@@ -549,26 +595,25 @@ def run_l4(l3_verdict, l2_evidence, transaction):
 
 
 def _regulation_hash(l3_verdict):
-    """Hash of the regulation version in effect - for L1 memory + L6 audit."""
+    """Hash of the guidance version in effect - for L1 memory + L6 audit."""
     basis = json.dumps({"clause_no": l3_verdict.get("clause_no", ""),
                         "clause": l3_verdict.get("clause", "")}, sort_keys=True)
     return hashlib.sha256(basis.encode()).hexdigest()
 
 
 # ============================================================================
-# PDF review copy - a human-readable RENDERING of the STR for the L5 reviewer.
-# NOTE: the legal artifact is the goAML XML. This PDF is a review copy only,
-# clearly labelled as such; FIU-IND accepts the XML, not a PDF.
+# PDF review copy - a human-readable RENDERING of the packet for the L5
+# reviewer. The legal/system artifact is the XML; this PDF is a review copy
+# only, clearly labelled as such.
 # ============================================================================
 def write_pdf_review_copy(result, l3_verdict, transaction, out_dir):
-    """Render a filed STR's XML into a labelled PDF on disk matching the new template. Returns the path."""
+    """Render a filed packet's XML into a labelled PDF on disk. Returns the path."""
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm, inch
+    from reportlab.lib.units import mm
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
-                                    TableStyle, PageBreak)
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.enums import TA_CENTER
 
     xml = result["xml"]
     doc_root = etree.fromstring(xml.encode())
@@ -579,48 +624,60 @@ def write_pdf_review_copy(result, l3_verdict, transaction, out_dir):
 
     tx_id = transaction.get("tx_id", "")
     os.makedirs(out_dir, exist_ok=True)
-    pdf_path = os.path.join(out_dir, f"STR_review_{tx_id}.pdf")
+    pdf_path = os.path.join(out_dir, f"DisputeEvidence_{tx_id}.pdf")
 
     styles = getSampleStyleSheet()
-    
-    # Styles matching the template
+
     title_style = ParagraphStyle("TitleStyle", parent=styles["Title"], fontSize=16, leading=20, alignment=TA_CENTER, spaceAfter=10, fontName="Helvetica-Bold")
-    
-    warning_style = ParagraphStyle("WarningStyle", parent=styles["Normal"], fontSize=9, textColor=colors.white, alignment=TA_CENTER, spaceBefore=0, spaceAfter=0, fontName="Helvetica-Bold")
-    
+    banner_style = ParagraphStyle("BannerStyle", parent=styles["Normal"], fontSize=9, textColor=colors.white, alignment=TA_CENTER, spaceBefore=0, spaceAfter=0, fontName="Helvetica-Bold")
     h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#1A365D"), spaceBefore=15, spaceAfter=8, fontName="Helvetica-Bold")
-    
     body = ParagraphStyle("BodyText", parent=styles["Normal"], fontSize=10, leading=14, spaceAfter=6, textColor=colors.black)
     body_bold = ParagraphStyle("BodyBold", parent=styles["Normal"], fontSize=10, leading=14, spaceBefore=4, spaceAfter=2, fontName="Helvetica-Bold", textColor=colors.black)
-    
     small_footer = ParagraphStyle("small_footer", parent=styles["Normal"], fontSize=8, textColor=colors.grey, leading=10)
 
+    action = gx(".//EvidenceAssessment/RecommendedAction")
+    banner_colors = {
+        "CONTEST_WITH_EVIDENCE": "#1A7F37",   # green
+        "CONCEDE": "#A00000",                 # red
+        "ESCALATE_TO_REVIEW": "#B36B00",      # amber
+    }
+    banner_labels = {
+        "CONTEST_WITH_EVIDENCE": "RECOMMENDATION: CONTEST WITH EVIDENCE",
+        "CONCEDE": "RECOMMENDATION: CONCEDE",
+        "ESCALATE_TO_REVIEW": "RECOMMENDATION: ESCALATE TO HUMAN REVIEW",
+    }
+    banner_hex = banner_colors.get(action, "#555555")
+    banner_text = banner_labels.get(action, "RECOMMENDATION: ESCALATE TO HUMAN REVIEW")
+
     story = []
-    
-    # 1. Title
-    story.append(Paragraph("Suspicious Transaction Report (STR)", title_style))
+    story.append(Paragraph("Dispute Evidence Packet", title_style))
     story.append(Spacer(1, 5))
-    
-    # 2. Warning Box (Red background, white text)
-    warning_text = "REVIEW COPY - NOT THE FILED ARTIFACT. The report filed with FIU-IND is the goAML XML. This PDF is a human-readable rendering for review only."
-    warning_table = Table([[Paragraph(warning_text, warning_style)]], colWidths=[170*mm])
-    warning_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#A00000")),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+
+    review_notice = "REVIEW COPY - NOT THE SYSTEM-OF-RECORD ARTIFACT. The Dispute Evidence Packet XML is the system artifact; this PDF is a human-readable rendering for review only."
+    review_table = Table([[Paragraph(review_notice, banner_style)]], colWidths=[170*mm])
+    review_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#555555")),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('TOPPADDING', (0,0), (-1,-1), 4), ('BOTTOMPADDING', (0,0), (-1,-1), 4),
     ]))
-    story.append(warning_table)
-    
-    # Helper for the clean template tables
+    story.append(review_table)
+    story.append(Spacer(1, 4))
+
+    action_table = Table([[Paragraph(banner_text, banner_style)]], colWidths=[170*mm])
+    action_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor(banner_hex)),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('TOPPADDING', (0,0), (-1,-1), 6), ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+    ]))
+    story.append(action_table)
+
     def clean_table(rows):
-        t = Table(rows, colWidths=[45*mm, 125*mm])
+        t = Table(rows, colWidths=[50*mm, 120*mm])
         t.setStyle(TableStyle([
             ("FONTNAME", (0, 0), (0, -1), "Helvetica"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#555555")), # First column light grey
-            ("TEXTCOLOR", (1, 0), (1, -1), colors.black),               # Second column black
+            ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#555555")),
+            ("TEXTCOLOR", (1, 0), (1, -1), colors.black),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#EEEEEE")),
             ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -628,84 +685,66 @@ def write_pdf_review_copy(result, l3_verdict, transaction, out_dir):
         ]))
         return t
 
-    # 3. Batch / Reporting Entity
-    story.append(Paragraph("Batch / Reporting Entity", h2))
+    story.append(Paragraph("Case / Responding Merchant", h2))
     story.append(clean_table([
-        ["Reporting Entity", gx(".//ReportingEntity/EntityName")],
-        ["Entity Ref", gx(".//ReportingEntity/EntityRefNum")],
-        ["Report Type", gx(".//ReportType")],
+        ["Responding Merchant", gx(".//RespondingMerchant/MerchantName")],
+        ["Merchant Ref", gx(".//RespondingMerchant/MerchantRefNum")],
+        ["Packet Type", gx(".//PacketType")],
         ["Batch Number", gx(".//BatchDetails/BatchNumber")],
         ["Batch Date", gx(".//BatchDetails/BatchDate")],
-        ["Month / Year of Report", "NA / NA"]
     ]))
-    
-    # 4. Suspicion Details
-    story.append(Paragraph("Suspicion Details", h2))
-    
-    # First part of Suspicion is a table
+
+    story.append(Paragraph("Evidence Assessment", h2))
     story.append(clean_table([
-        ["Main Person", gx(".//Report/MainPersonName")],
-        ["Suspicion Type", gx(".//SuspicionType")],
-        ["Date of Suspicion", gx(".//DateOfSuspicion")],
-        ["L3 Confidence", str(l3_verdict.get("confidence", "N/A"))]
+        ["Principal Party", gx(".//Case/PrincipalPartyName")],
+        ["Dispute Reason Category", gx(".//EvidenceAssessment/DisputeReasonCategory")],
+        ["Evidence Tier", gx(".//EvidenceAssessment/EvidenceTier")],
+        ["Date of Assessment", gx(".//EvidenceAssessment/DateOfAssessment")],
+        ["L3 Confidence", str(l3_verdict.get("confidence", "N/A"))],
     ]))
-    
     story.append(Spacer(1, 5))
-    
-    # Second part of Suspicion is text paragraphs (Grounds and Citation)
-    # Using a 0-margin table or just paragraphs. Paragraphs with a bit of indent work well.
-    story.append(Paragraph("Grounds of Suspicion", body_bold))
-    grounds_text = gx(".//GroundsOfSuspicion") or "Suspicious activity detected."
-    for p in grounds_text.split('\n'):
+
+    story.append(Paragraph("Evidence Summary", body_bold))
+    summary_text = gx(".//EvidenceAssessment/EvidenceSummary") or "Evidence under review."
+    for p in summary_text.split('\n'):
         if p.strip():
             story.append(Paragraph(p.strip(), body))
-            
-    story.append(Paragraph("Regulation Citation", body_bold))
-    raw_citation = gx(".//RegulationCitation") or "N/A"
+
+    story.append(Paragraph("Rule Citation", body_bold))
+    raw_citation = gx(".//EvidenceAssessment/RuleCitation") or "N/A"
     for c in raw_citation.split('\n'):
         if c.strip():
             story.append(Paragraph(c.strip(), body))
 
-    # 5. Transaction
     story.append(Paragraph("Transaction", h2))
-    
-    sender_name = gx('.//CustomerDetails/Name')
-    sender_pan = gx('.//CustomerDetails/PAN')
-    sender_display = f"{sender_name} (PAN {sender_pan})" if sender_pan else sender_name
-    
-    receiver_name = gx('.//RelatedPersons/Name')
-    receiver_pan = gx('.//RelatedPersons/PAN')
-    receiver_display = f"{receiver_name} (PAN {receiver_pan})" if receiver_pan else receiver_name
-    
+    cardholder_name = gx('.//CardholderDetails/Name')
+    cardholder_pan = gx('.//CardholderDetails/PAN')
+    cardholder_display = f"{cardholder_name} (PAN {cardholder_pan})" if cardholder_pan else cardholder_name
+    merchant_name = gx('.//RelatedParties/Name')
+
     story.append(clean_table([
         ["Transaction No.", gx(".//Transaction/TransactionNumber")],
         ["Date", gx(".//Transaction/TransactionDate")],
-        ["Mode", gx(".//Transaction/TransactionMode")],
+        ["Delivery Status", gx(".//Transaction/DeliveryStatus")],
         ["Amount", f"{gx('.//Transaction/Amount')} {gx('.//Transaction/Currency')}"],
-        ["Customer (Sender)", sender_display],
-        ["Related (Receiver)", receiver_display]
+        ["Cardholder", cardholder_display],
+        ["Merchant Party", merchant_name],
     ]))
-    
+
     story.append(Spacer(1, 20))
-    
-    # 6. Footer
     warns = result.get("warnings", [])
     footer_text = (
         f"Generated by L4 in {result['attempts']} attempt(s). "
         f"{len(warns)} non-blocking data-quality warning(s). "
-        "Validated against POC-reconstructed schema + FIU PRV rule set; "
-        "enum codes are placeholders pending FINnet Lookup Master."
+        "Validated against an original POC schema (DisputeEvidencePacket_POC.xsd), "
+        "not a reproduction of any real card network's operating regulations."
     )
     story.append(Paragraph(footer_text, small_footer))
 
-    # Build PDF
     SimpleDocTemplate(pdf_path, pagesize=A4,
                       topMargin=15*mm, bottomMargin=15*mm,
                       leftMargin=20*mm, rightMargin=20*mm).build(story)
     return pdf_path
-
-
-
 
 
 import csv
@@ -719,9 +758,11 @@ def _row_to_inputs(row):
         "amount": row["amount"],
         "currency": row["currency"],
         "channel": row["channel"],
+        "delivery_status": row.get("delivery_status", ""),
+        "dispute_reason": row.get("dispute_reason", ""),
     }
     l2_evidence = {
-        "primary_category": row.get("primary_category", "") or "C1",
+        "primary_category": row.get("primary_category", "") or "C5",
         "l2_score": row.get("l2_score", ""),
         "l2_triggers": [t for t in (row.get("l2_triggers", "") or "").split(";") if t],
         "sender": {"name": row.get("sender_name", ""),
@@ -746,8 +787,7 @@ def _resolve_desktop():
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     if os.path.isdir(desktop):
         return desktop
-    # running in a sandbox / headless env without a Desktop
-    fallback = os.path.join(HERE, "str_pdfs")
+    fallback = os.path.join(HERE, "dispute_pdfs")
     return fallback
 
 
@@ -768,22 +808,22 @@ def run_from_csv(csv_path, pdf_dir=None):
         txn, l2, l3 = _row_to_inputs(row)
         tx_id = txn["tx_id"]
 
-        # L4 only fires when L3 flagged the txn SUSPICIOUS. Clean txns skip L4.
+        # L4 only fires when L3 flagged the txn for filing. Clean txns skip L4.
         if l3["verdict"].upper() != "SUSPICIOUS":
             print(f"\n[{tx_id}]  L3 verdict={l3['verdict']} (conf {l3['confidence']}) "
-                  f"-> NOT routed to L4 (no STR)")
+                  f"-> NOT routed to L4 (no packet)")
             continue
 
         result = run_l4(l3, l2, txn)
         disp = result["disposition"]
-        print(f"\n[{tx_id}]  L3 SUSPICIOUS (conf {l3['confidence']}) "
+        print(f"\n[{tx_id}]  L3 flagged (conf {l3['confidence']}) "
               f"clause={l3['clause_no'] or '(none)'}")
         if disp == "FILED":
             pdf_path = write_pdf_review_copy(result, l3, txn, pdf_dir)
             print(f"    -> FILED in {result['attempts']} attempt(s), "
                   f"{len(result['warnings'])} warning(s)")
             print(f"    -> reg_hash {result['to_L1']['regulation_hash'][:16]}... "
-                  f"sent to L1; STR XML + log sent to L6")
+                  f"sent to L1; packet XML + log sent to L6")
             print(f"    -> PDF review copy: {pdf_path}")
         else:
             print(f"    -> {disp} after {result['attempts']} attempts; "

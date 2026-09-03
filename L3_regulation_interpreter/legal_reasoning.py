@@ -9,44 +9,55 @@ import json
 from typing import Any, Dict, List, Sequence
 
 from .llm_client import chat_json, is_llm_configured
+from .hybrid_retrieval import _compute_retrieval_match
 
 
 SYSTEM_PROMPT = """
-You are the legal reasoning engine for an RBI/NPCI/PMLA compliance pipeline.
+You are the dispute-evidence reasoning engine for a merchant chargeback response pipeline.
 
 Your job is to reason over:
-- transaction facts
-- retrieved regulatory chunks
-- suspicious transaction typologies
+- transaction and dispute facts (including the delivery-confirmation status and
+  any risk signals raised upstream)
+- retrieved card-network dispute-category and compelling-evidence guidance
+- known dispute typologies (fraud, friendly fraud, merchant error)
 
 You must return ONLY valid JSON.
-Be conservative, cite the retrieved material, and never invent a regulation that
-is not present in the retrieved chunks.
+Be conservative, cite the retrieved material, and never invent a rule that is
+not present in the retrieved chunks.
 
 CRITICAL INSTRUCTION FOR L2 TRIGGERS:
-If the transaction has an 'l2_triggers_fired' flag (e.g., C1_velocity, structuring), you MUST mathematically assume that the backend already verified the aggregated sums. For example, if a rule states "monthly aggregate exceeds 10 lakhs", and the L2 velocity trigger fired, you must assume the 10 lakh threshold was successfully breached by the customer's history, even if the single transaction amount is smaller. Score the transaction highly (e.g., 0.80+) if the rule conceptually matches the trigger.
+If the transaction has an 'l2_triggers_fired' flag (e.g., C5_evidence_favors_contest,
+C5_evidence_favors_concede), you MUST treat the upstream signal as already-verified
+evidence, not as something to re-derive from scratch. For example, if C5 reports
+delivery-confirmed evidence favoring a contest, and a retrieved rule states that
+confirmed delivery is compelling evidence for a consumer-dispute-category case,
+score the case highly (e.g., 0.80+) for a CONTEST verdict. If C2/C6 report
+account-takeover-style signals (known fraud IP, impossible travel, new-device
+takeover), treat that as evidence supporting FRAUD-category concession, not
+contest, per the corpus guidance that delivery evidence does not rebut a
+fraud-category claim.
 
 CRITICAL INSTRUCTION ON JARGON:
-When writing the "explanation", DO NOT use internal pipeline jargon or abbreviations such as C1, C2, L1, L2, L3, or L4. The final reader of the report will not understand these terms. Instead of saying "L2 trigger C1_velocity fired", write "The transaction history triggered a high-velocity screening alert" or describe the actual behavior. Use clear, professional, plain language to explain the reasoning and the patterns observed.
+When writing the "explanation", DO NOT use internal pipeline jargon or abbreviations such as C1, C2, C5, L1, L2, L3, or L4. The final reader of the report (a dispute-ops analyst or the merchant) will not understand these terms. Instead of saying "L2 trigger C5_evidence_favors_contest fired", write "Delivery was confirmed to the cardholder's address despite the dispute" or describe the actual behavior. Use clear, professional, plain language to explain the reasoning and the patterns observed.
 """.strip()
 
 
 USE_CASES = [
     {
-        "name": "smurfing",
-        "description": "Repeated smaller transactions within a short timeframe intended to avoid reporting thresholds.",
+        "name": "friendly_fraud",
+        "description": "The cardholder disputes a transaction they genuinely made and received the benefit of (goods delivered, service used), typically to avoid payment rather than because the charge was actually unauthorized.",
     },
     {
-        "name": "mule_accounts",
-        "description": "Recently opened accounts showing immediate, sustained, high-volume inflows and outflows suggestive of layering.",
+        "name": "true_fraud",
+        "description": "The payment credential was genuinely compromised (stolen card, account takeover); the dispute is valid and no legitimate delivery/fulfilment evidence can rebut it.",
     },
     {
-        "name": "inconsistent_geographic_activity",
-        "description": "Sudden cross-border or geographically inconsistent activity for a customer profile.",
+        "name": "merchant_error",
+        "description": "A genuine merchant-side or processing fault: item never shipped, duplicate charge, or an incorrect amount charged.",
     },
     {
-        "name": "ghost_accounts",
-        "description": "Dormant or long-idle accounts suddenly receiving or sending large-value funds.",
+        "name": "delivery_dispute",
+        "description": "The cardholder disputes non-receipt or a fulfilment defect where delivery status is ambiguous (in-transit, unconfirmed, or delivered to an unverified address) rather than clearly proven either way.",
     },
 ]
 
@@ -106,8 +117,31 @@ Return ONLY JSON with this exact structure:
 }}
 
 Scoring guidance:
-Final score MUST reflect the weighted legal confidence after reasoning. 
+Final score MUST reflect the weighted legal confidence after reasoning.
 If the rules are weakly related or evidence is thin, lower the score.
+
+CRITICAL CALIBRATION INSTRUCTION FOR rule_applicability:
+Do not score rule_applicability based on whether the retrieved text is
+topically adjacent (e.g. "this is also about UPI disputes") -- score it on
+whether the retrieved rule specifically and directly decides THIS fact
+pattern. Use this concrete scale:
+  0.8-1.0: the retrieved rule's own text directly names the specific
+    scenario in front of you (e.g. the exact liability trigger, the exact
+    evidence requirement) and tells you what outcome follows.
+  0.4-0.7: the retrieved rule is genuinely relevant background (e.g. it
+    establishes the general dispute-lifecycle stages or a related timing
+    rule) but does not itself resolve whether THIS transaction should be
+    contested or conceded -- you are still bridging a real inferential gap.
+  0.0-0.3: the retrieved rule is only topically adjacent (mentions UPI
+    disputes, chargebacks, or evidence in general) without addressing the
+    specific fact pattern (e.g. a procedural TAT/format rule when the real
+    question is fraud-vs-friendly-fraud liability, or vice versa).
+A retrieval hit is not the same as a rule applying. If you find yourself
+reasoning "well, it's at least about disputes in general" -- that is a 0.2-0.4
+case, not a 0.7+ case. Most real cases in this domain sit in the 0.4-0.7
+band, because a single short circular rarely fully decides a fact pattern by
+itself; treat anything above 0.7 as reserved for genuinely direct, on-point
+matches, not the default.
 """.strip()
 
 def _enrich_citation_trail(citation_trail, all_chunks):
@@ -139,6 +173,56 @@ def _enrich_citation_trail(citation_trail, all_chunks):
     return enriched
 
 
+def _clamp01(v, default=0.0):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, v))
+
+
+def _finalize_score(analysis, chunks):
+    """
+    Replaces two things the raw LLM output can't be trusted for, with real
+    computed/deterministic values:
+
+    1. `retrieval_match` -- the prompt asks the LLM to estimate this itself
+       from the chunks it's shown, but we already COMPUTE this precisely
+       (cosine similarity locally, RRF fusion via Azure) before the LLM ever
+       sees anything. Observed in practice: real computed retrieval_match
+       0.929 (a genuinely strong match) vs. the LLM's own self-reported
+       guess of 0.2 for the same case -- a wrong, redundant re-estimate that
+       then silently drags the final score down with it.
+    2. `final_score` -- previously the LLM's own free-floating number, with
+       no formula tying it to the 4 sub-scores at all (the prompt only said
+       "reflect the weighted confidence", not an actual weight). That's why
+       the same case could score 0.55 on one call and 0.75 on the next --
+       it wasn't measuring anything stable, just "however conservative the
+       model felt that call." Now final_score is a real, fixed formula:
+       35% real retrieval_match + 30% rule_applicability + 20% evidence_sufficiency
+       + 15% precedent_confidence (the LLM still judges these three -- that's
+       genuine legal reasoning, not something we can compute directly).
+    """
+    if not analysis:
+        return analysis
+    real_retrieval_match = _compute_retrieval_match(chunks)
+    rule_applicability = _clamp01(analysis.get("rule_applicability"))
+    evidence_sufficiency = _clamp01(analysis.get("evidence_sufficiency"))
+    precedent_confidence = _clamp01(analysis.get("precedent_confidence"))
+    computed_score = round(
+        0.35 * real_retrieval_match
+        + 0.30 * rule_applicability
+        + 0.20 * evidence_sufficiency
+        + 0.15 * precedent_confidence,
+        4,
+    )
+    analysis["llm_self_reported_retrieval_match"] = analysis.get("retrieval_match")
+    analysis["llm_self_reported_final_score"] = analysis.get("final_score")
+    analysis["retrieval_match"] = round(real_retrieval_match, 4)
+    analysis["final_score"] = computed_score
+    return analysis
+
+
 def generate_legal_analysis(event, retrieval):
     """
     Uses a large language model to analyze the transaction against the retrieved regulations.
@@ -166,6 +250,7 @@ def generate_legal_analysis(event, retrieval):
                     user_prompt=_build_reasoning_prompt(event, azure_chunks),
                 )
                 azure_analysis["backend_used"] = "azure_ai_search"
+                azure_analysis = _finalize_score(azure_analysis, azure_chunks)
         except Exception as exc:
             print(f"L3: Azure evaluation failed: {exc}")
 
@@ -176,6 +261,7 @@ def generate_legal_analysis(event, retrieval):
                     user_prompt=_build_reasoning_prompt(event, nomic_chunks),
                 )
                 nomic_analysis["backend_used"] = "local_nomic_search"
+                nomic_analysis = _finalize_score(nomic_analysis, nomic_chunks)
         except Exception as exc:
             print(f"L3: Local Nomic evaluation failed: {exc}")
 

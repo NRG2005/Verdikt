@@ -255,10 +255,24 @@ def _compute_retrieval_match(top_chunks: Sequence[Dict[str, Any]]) -> float:
 
     top_score = float(top_chunks[0].get("retrieval_score", 0.0))
     avg_top = sum(float(row.get("retrieval_score", 0.0)) for row in top_chunks[:3]) / min(len(top_chunks), 3)
-    
-    # Azure search scores can be higher than 1.0 (sometimes 0.01 to 2.0+ depending on hybrid)
-    # We normalize it very roughly for the L3 pipeline (0 to 1 range)
-    match_score = min(1.0, ((0.65 * top_score) + (0.35 * avg_top)) / 2.0)
+
+    # Two genuinely different score scales land here, and treating them the
+    # same silently under-reported Azure hybrid results as near-zero
+    # confidence:
+    #   - Local Chroma cosine similarity: already 0-1, ~0.5+ for a real match.
+    #   - Azure hybrid RRF fusion score: Azure's formula is
+    #     sum(1/(k+rank)) per contributing query leg with default k=60, so a
+    #     document ranked #1 in BOTH the keyword and vector legs scores
+    #     ~1/61 + 1/61 = 0.0328 -- that IS the practical ceiling, not a weak
+    #     match. Dividing by ~2.0 (as if this were a 0-1ish score) mapped a
+    #     best-possible RRF result to ~1.6% instead of ~100%.
+    # RRF scores are reliably small (<0.2); cosine scores are not. Detect and
+    # rescale accordingly rather than using one linear formula for both.
+    RRF_CEILING = 2.0 / 61.0  # best-possible score: rank 1 on both legs, k=60
+    if top_score < 0.2:
+        match_score = min(1.0, ((0.65 * top_score) + (0.35 * avg_top)) / RRF_CEILING)
+    else:
+        match_score = min(1.0, (0.65 * top_score) + (0.35 * avg_top))
     return round(match_score, 4)
 
 
@@ -311,28 +325,40 @@ def search_regulations(
         except Exception as local_exc:
             print(f"L3: Local ChromaDB vector search failed: {local_exc}")
             
-        # 2. Azure AI Search
+        # 2. Azure AI Search -- genuine hybrid (BM25 keyword + vector, RRF-fused
+        # by Azure) against "chargeback-dispute-corpus", a NEW index built
+        # from the current regulation_corpus.json (see azure_reindex.py).
+        # The original "compliance-regulations" index (1583 docs) was left
+        # untouched -- it's the old AML corpus and a shared resource, not
+        # something to overwrite without being asked to. This new index uses
+        # the same nomic-embed-text vectors as the local Chroma path, so the
+        # two retrieval backends are genuinely comparable, not one real one
+        # fake.
         try:
             from azure.core.credentials import AzureKeyCredential
             from azure.search.documents import SearchClient
             from azure.search.documents.models import VectorizedQuery
-            
+
             endpoint = os.environ.get("SEARCH_ENDPOINT")
             key = os.environ.get("SEARCH_API_KEY")
-            index_name = "compliance-regulations"
-            
+            index_name = os.environ.get("AZURE_SEARCH_INDEX", "chargeback-dispute-corpus")
+
             if endpoint and key:
                 credential = AzureKeyCredential(key)
                 search_client = SearchClient(endpoint=endpoint, index_name=index_name, credential=credential)
-                
-                keyword_search_string = " ".join(query.get("keywords", []))
-                
-                results = search_client.search(
-                    search_text=keyword_search_string, # Pure keywords, no dilution
-                    select=["chunk_id", "document_id", "title", "content", "section_heading"],
-                    top=top_k
+
+                keyword_search_string = " ".join(query.get("keywords", [])) or query.get("query_text", "")
+                vector_query = VectorizedQuery(
+                    vector=query_vector, k_nearest_neighbors=top_k, fields="content_vector"
                 )
-                
+
+                results = search_client.search(
+                    search_text=keyword_search_string,  # BM25 keyword leg
+                    vector_queries=[vector_query],       # vector leg -- Azure fuses both (RRF)
+                    select=["chunk_id", "document_id", "title", "content", "section_heading"],
+                    top=top_k,
+                )
+
                 for result in results:
                     score = result["@search.score"]
                     azure_chunks.append({

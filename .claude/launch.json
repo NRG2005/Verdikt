@@ -1,4 +1,11 @@
 {
   "version": "0.0.1",
-  "configurations": []
+  "configurations": [
+    {
+      "name": "regulatory-ui-react",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "regulatory-ui-react", "run", "dev"],
+      "port": 5173
+    }
+  ]
 }

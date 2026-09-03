@@ -149,12 +149,60 @@ def _call_ollama(
         raw_payload = json.loads(response.read().decode("utf-8"))
 
     raw_text = _extract_text_from_ollama_response(raw_payload)
+    return _parse_json_object(raw_text)
 
+
+def _parse_json_object(raw_text: str) -> Dict[str, Any]:
+    """Parse the model's JSON object, tolerating trailing text after it.
+
+    Local models (phi4 observed doing this in practice) sometimes emit a
+    complete, valid JSON object followed by extra commentary/whitespace --
+    strict json.loads() rejects the whole response as "Extra data" in that
+    case, which used to silently degrade the entire L3 analysis to an empty
+    error dict with final_score missing (confidence ends up None downstream,
+    which is worse than a slightly-noisy real answer). This finds the first
+    balanced top-level {...} object and parses just that.
+    """
     try:
         return json.loads(raw_text)
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"L3: Ollama response was not valid JSON: {exc}")
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    start = raw_text.find("{")
+    if start == -1:
+        print("L3: Ollama response had no JSON object at all.")
         return {"raw_response": raw_text, "error": "ollama_json_parse_failed"}
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(raw_text)):
+        ch = raw_text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = raw_text[start:i + 1]
+                try:
+                    print("L3: Ollama response had trailing extra data; parsed the leading JSON object instead.")
+                    return json.loads(candidate)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    print(f"L3: Ollama response was not valid JSON even after trimming: {exc}")
+                    return {"raw_response": raw_text, "error": "ollama_json_parse_failed"}
+
+    print("L3: Ollama response's JSON object was never closed.")
+    return {"raw_response": raw_text, "error": "ollama_json_parse_failed"}
 
 
 def generate_ollama_embedding(text: str) -> List[float]:
@@ -191,17 +239,21 @@ def generate_ollama_embedding(text: str) -> List[float]:
 def chat_json(
     system_prompt: str, user_prompt: str, model: str | None = None
 ) -> Dict[str, Any]:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    chosen_model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    """
+    Track 02 retrofit: local Ollama (phi4, per OLLAMA_MODEL) is now PRIMARY,
+    matching the original project's design intent -- no dependency on a
+    cloud key or its rate limits. Gemini is opt-in only, via
+    L3_USE_GEMINI=true, for anyone who wants to compare against it.
+    """
+    if os.environ.get("L3_USE_GEMINI", "false").lower() == "true":
+        api_key = os.environ.get("GEMINI_API_KEY")
+        chosen_model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        if api_key:
+            try:
+                return _call_gemini(api_key, chosen_model, system_prompt, user_prompt)
+            except Exception as e:
+                print(f"L3: Gemini call failed: {e}")
+        else:
+            print("L3: L3_USE_GEMINI=true but GEMINI_API_KEY is not set. Using Ollama.")
 
-    # --- Try Gemini first (with retries) ---
-    if api_key:
-        try:
-            return _call_gemini(api_key, chosen_model, system_prompt, user_prompt)
-        except Exception as e:
-            print(f"L3: Gemini call failed: {e}")
-    else:
-        print("L3: GEMINI_API_KEY is not set. Skipping Gemini, using Ollama.")
-
-    # --- Fallback to Ollama ---
     return _call_ollama(system_prompt, user_prompt)

@@ -708,43 +708,39 @@ def check_sanctions_and_watchlist(transaction_data):
 
 
 # ---------------------------------------------------------------------------
-# Unified-pipeline adapter  (used by orchestrator.py)
+# Unified-pipeline adapter  (used by orchestrator.py)  —  Track 02 retrofit
 # ---------------------------------------------------------------------------
+# ORIGINAL ROLE (AML pipeline): fuzzy PERSON/ENTITY screening (name/alias/PAN/
+# DOB) against a sanctions & PEP watchlist — the whole engine above this
+# point (`stage1_candidates`, `token_set_ratio`, `t2_check`, `slm_judge_*`)
+# implements that, and is left untouched/available for reuse if the hackathon
+# ever wants to screen a disputing CARDHOLDER's name/DOB against a registry
+# of known serial-disputer identities.
+#
+# NEW ROLE (Track 02): the reference list this category screens against is
+# now a device/IP fraud-ring registry (`watchlist.csv`, repurposed — see
+# `generate_chargeback_dataset.py`), keyed on IP address rather than a
+# person's name. Fuzzy name-matching doesn't apply to an IP/device string —
+# infrastructure is either shared with confirmed fraud or it isn't — so this
+# adapter does a direct exact-match lookup instead of invoking the fuzzy
+# engine above. This is a smaller, more honest algorithm for this signal,
+# not a cost-cut version of the same one.
 def evaluate_row(row, watchlist):
     """
-    Adapt a unified transactions.csv row to the C2 two-stage check and return
-    the orchestrator contract: {fired, score, trigger}.
-
-    Screens the RECEIVER only (sender is KYC-screened at onboarding). A match
-    fires ONLY when a DECISIVE corroborator is present — PAN, CIN, exact name,
-    exact alias, or a DOB match. A fuzzy name/alias token on its own (common
-    Indian names, single-char typos with a conflicting DOB) is NOT sufficient:
-    this is the PAN/DOB disambiguation the C2 spec requires to suppress the
-    common-name and fuzzy-typo false positives.
+    Screen the transaction's `ip_address` (sender/cardholder side) against a
+    registry of IPs previously linked to confirmed account-takeover fraud.
+    Returns the orchestrator contract: {fired, score, trigger}.
     """
-    event = row_to_event(row)
-    res = t2_check(event, watchlist, 0.55, 0.95, slm_judge_mock, {})
-    if not res["hit"]:
+    ip = (row.get("ip_address") or "").strip()
+    if not ip:
         return {"fired": False, "score": 0.0, "trigger": None}
 
-    # Decisive corroborators: a strong identifier, OR an exact known alias.
-    # A bare exact/fuzzy NAME match with no PAN/CIN/DOB and no exact alias is a
-    # common-name collision (e.g. "Karan Patel") and must NOT fire.
-    IDENTIFIER = {"PAN", "CIN", "DOB_MATCH", "PASSPORT"}
-    decisive = False
-    alias_decisive = False
-    for m in res["matches"]:
-        attrs = {a for a, _ in m.get("matched_on", [])}
-        if m.get("dob_status") == "CONFLICT" and not (attrs & {"PAN", "CIN"}):
-            continue  # DOB conflict overrides a name/alias match
-        if attrs & IDENTIFIER:
-            decisive = True
-        if "ALIAS_EXACT" in attrs:
-            decisive = True
-            alias_decisive = True
+    for entry in watchlist:
+        if (entry.get("last_known_address") or "").strip() == ip:
+            return {
+                "fired": True,
+                "score": 0.90,
+                "trigger": "C2_known_fraud_ip",
+            }
 
-    if not decisive:
-        return {"fired": False, "score": 0.0, "trigger": None}
-
-    trigger = "C2_alias_hit" if alias_decisive else "C2_watchlist_hit"
-    return {"fired": True, "score": round(float(res["max_score"]), 4), "trigger": trigger}
+    return {"fired": False, "score": 0.0, "trigger": None}

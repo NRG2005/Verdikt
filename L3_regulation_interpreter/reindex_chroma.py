@@ -13,7 +13,16 @@ def reindex():
         client.delete_collection('compliance_regulations')
     except:
         pass
-    collection = client.create_collection('compliance_regulations')
+    # Explicit cosine space: hybrid_retrieval.py's similarity formula
+    # (1 - distance/2) assumes a distance range of [0,2], which only holds
+    # for cosine distance. Chroma's default metric is raw L2, which produced
+    # nonsensical similarity scores (e.g. -134) for the retrieval_match
+    # confidence figure -- a pre-existing bug, not introduced by this swap,
+    # fixed here since it directly affects the "explainable confidence"
+    # number shown downstream.
+    collection = client.create_collection(
+        'compliance_regulations', metadata={"hnsw:space": "cosine"}
+    )
 
     payload = json.loads(open('L3_regulation_interpreter/regulation_corpus.json', 'r').read())
     docs = payload.get('documents', [])

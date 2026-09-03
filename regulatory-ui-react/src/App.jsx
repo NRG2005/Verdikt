@@ -22,10 +22,30 @@ export default class App extends React.Component {
     reportProgress: 0, filed: false, reportModal: false,
     statT: 0, openCat: -1, focusArea: null, samplePage: 0,
     userTxns: [], uploadName: '', lastScraped: this.nowStr(),
-    circModal: false, circLane: null, explainOpen: false
+    circModal: false, circLane: null, explainOpen: false,
+    reviewCases: [], reviewLoading: false, reviewError: null,
+    reviewSelectedId: null, reviewSubmitting: false, reviewAuditStatus: null,
+    reviewDecidedCases: [], reviewLastDecision: null,
+    lastLiveError: null
   }
 
   fileRef = React.createRef()
+
+  componentDidMount() {
+    // Auto-load real transactions from the generated dataset into the same
+    // table/picker the manual-upload flow already uses, instead of leaving
+    // the user stuck with only the 6 hardcoded demo scenarios until they
+    // manually upload a CSV. Skips if something's already loaded (e.g. a
+    // manual upload beat this, or hot-reload during dev).
+    if (this.state.userTxns.length > 0) return
+    fetch(`${this.BACKEND}/api/sample-transactions?limit=100`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text() })
+      .then(text => {
+        const rows = this.parseCsv(text)
+        if (rows.length) this.setState({ userTxns: rows, uploadName: 'transactions.csv (live dataset)' })
+      })
+      .catch(err => this.setState({ lastLiveError: `Could not load the real transaction dataset: ${err.message} — only the 6 demo scenarios are available. Is the backend running?` }))
+  }
 
   get speed() { return this.props.speed ?? 1 }
 
@@ -184,16 +204,23 @@ export default class App extends React.Component {
       is_cross_border: read('is_cross_border'),
       usd_equiv: read('usd_equiv'),
       fx_usd_inr: read('fx_usd_inr'),
-      beneficiary_id: read('beneficiary_id') || receiverAccountExternal
+      beneficiary_id: read('beneficiary_id') || receiverAccountExternal,
+      // Track 02 fields -- without these C5 (delivery-evidence) and L4's
+      // Dispute Evidence Packet can't do their job; they were missing here
+      // entirely, so every uploaded/table-picked transaction was silently
+      // losing its dispute context on the way to the backend.
+      delivery_status: read('delivery_status'),
+      dispute_reason: read('dispute_reason'),
+      dispute_filed: read('dispute_filed')
     }
   }
 
   DET_MATCH = [
-    ['structuring', ['structuring', 'smurf']],
-    ['sanctions', ['watchlist', 'sanction', 'alias', 'pep']],
+    ['structuring', ['structuring', 'smurf', 'split-payment', 'split payment']],
+    ['sanctions', ['watchlist', 'sanction', 'alias', 'pep', 'fraud ip', 'known fraud']],
     ['mule', ['mule', 'fan-in', 'fanin', 'sweep', 'round-trip', 'roundtrip', 'layering']],
-    ['velocity', ['velocity', 'high value', 'credit', 'dormant', 'new account', 'behaviour', 'behavior']],
-    ['fema', ['lrs', 'fema', 'ceiling', 'beneficiary split', 'gift', 'cross']],
+    ['velocity', ['velocity', 'high value', 'high-value', 'credit', 'dormant', 'new account', 'behaviour', 'behavior']],
+    ['fema', ['lrs', 'fema', 'ceiling', 'beneficiary split', 'gift', 'cross', 'delivery', 'evidence', 'contest', 'concede']],
     ['geo', ['geo', 'device', 'travel', 'jurisdiction', 'fatf', 'takeover', 'location']]
   ]
   detFor(label) {
@@ -210,10 +237,10 @@ export default class App extends React.Component {
     fired.forEach(c => { const id = this.detFor(c.label); if (id) { results[id] = { v: 'hit', note: c.label }; if (!firstId) firstId = id } })
     const v = result.verdict
     let verdict
-    if (v === 'clean' || v === 'dismissed') verdict = { tone: 'clear', title: 'AUTO-CLEARED', line: result.verdict_detail || 'No typology or watchlist match.' }
-    else if (v === 'str_filed') verdict = { tone: 'hit', title: 'ESCALATE — File STR', line: result.verdict_detail || 'Reportable to FIU-IND under PMLA, 2002.' }
-    else if (v === 'human_review') verdict = { tone: 'flag', title: 'HOLD — Human review', line: result.verdict_detail || 'Queued for compliance review.' }
-    else verdict = { tone: 'hit', title: 'ESCALATE — Priority', line: result.verdict_detail || 'Escalated to a compliance officer.' }
+    if (v === 'clean' || v === 'dismissed') verdict = { tone: 'clear', title: 'AUTO-CLEARED', line: result.verdict_detail || 'No dispute-risk typology match.' }
+    else if (v === 'str_filed') verdict = { tone: 'hit', title: 'Dispute Evidence Packet filed', line: result.verdict_detail || 'Recommendation generated and routed for async review.' }
+    else if (v === 'human_review') verdict = { tone: 'flag', title: 'HOLD — Human review', line: result.verdict_detail || 'Queued in the human review queue.' }
+    else verdict = { tone: 'hit', title: 'ESCALATE — Priority', line: result.verdict_detail || 'Escalated to a dispute ops officer.' }
     // short-circuit: reportable verdict reached (e.g. L1 MinHash match) without L2 checks firing.
     // In that case there are no fresh agent flags, so the caller should keep the authored red results.
     const shortCircuited = fired.length === 0 && verdict.tone !== 'clear'
@@ -261,21 +288,35 @@ export default class App extends React.Component {
       sample.verdict = m.verdict
       sample.liveCites = result.regulatory_basis || []
       sample.strPdfUrl = result.str_pdf_url || null
+      sample.l4Disposition = result.l4_disposition || null
+      sample.l4RecommendedAction = result.l4_recommended_action || null
       if (m.clearGraph) sample.graphType = null
       sample.live = true
-    }).catch(() => { /* backend unreachable — keep the built-in demo data */ })
+      sample.liveError = null
+      this.setState({ lastLiveError: null })
+    }).catch(err => {
+      // Previously silent — this is a REAL pipeline failure (backend down,
+      // an LLM call erroring, etc), not a benign "demo mode" fallback. Make
+      // it visible instead of quietly showing pre-scripted data as if it
+      // were live: that's what made the whole pipeline look broken/unclear
+      // when the actual cause was e.g. a rate-limited API call.
+      const msg = (err && err.message) || String(err)
+      sample.live = false
+      sample.liveError = msg
+      this.setState({ lastLiveError: `Live pipeline call failed for ${sample.tx_id || 'this transaction'}: ${msg} — showing scripted demo data below instead.` })
+    })
     
     return sample._fetchPromise
   }
 
   // ---------- data ----------
   DET = [
-    { id: 'structuring', name: 'Structuring detection', q: 'Is a high-value transfer broken into sub-threshold tranches to evade CTR reporting?' },
-    { id: 'sanctions', name: 'Sanctions & PEP screening', q: 'Does any counterparty match a sanctions, PEP or adverse-media watchlist?' },
-    { id: 'mule', name: 'Mule-account layering', q: 'Is value layered through pass-through mule accounts to obscure beneficial ownership?' },
-    { id: 'velocity', name: 'Velocity & behaviour', q: 'Does transaction velocity deviate sharply from the account\'s behavioural baseline?' },
-    { id: 'fema', name: 'FEMA / LRS threshold', q: 'Does cumulative outward remittance breach the FEMA / LRS ceiling?' },
-    { id: 'geo', name: 'Geolocation anomaly', q: 'Is the session geo or device inconsistent — indicative of impossible travel?' }
+    { id: 'structuring', name: 'Velocity & structuring', q: 'Is a high-value purchase broken into sub-threshold transactions, or is velocity spiking against the account\'s baseline?' },
+    { id: 'sanctions', name: 'Known fraud IP/device', q: 'Does the transaction\'s IP or device match a registry of infrastructure previously linked to confirmed account-takeover fraud?' },
+    { id: 'mule', name: 'Network / mule flow', q: 'Is value being funnelled through a fan-in collector account and swept out, indicative of a refund-mule ring?' },
+    { id: 'velocity', name: 'Account risk & dormancy', q: 'Is a long-dormant account suddenly transacting, or a thin-KYC new account making an outsized first purchase?' },
+    { id: 'fema', name: 'Delivery-evidence signal', q: 'For a filed dispute, does the merchant\'s own delivery record support contesting or conceding it?' },
+    { id: 'geo', name: 'Geo / device anomaly', q: 'Is the session geo or device inconsistent with the account\'s history — indicative of impossible travel or takeover?' }
   ]
 
   SAMPLES = [
@@ -399,7 +440,16 @@ export default class App extends React.Component {
       { code: 'RBI MD-KYC', ref: 'Master Direction · para 42', note: 'Baseline sanctions & monitoring cleared — straight-through processed.', url: 'https://www.rbi.org.in/Scripts/BS_ViewMasDirections.aspx' }
     ]
   }
-  citesFor(sample) { return this.CITES[sample && sample.graphType] || this.CITES._clean }
+  citesFor(sample) {
+    // Real backend citations take priority whenever they exist -- this
+    // previously ignored sample.liveCites entirely and always looked up a
+    // hardcoded demo dict by graphType, which a live/table-picked
+    // transaction (graphType: '_live') never matches, silently falling
+    // back to the canned "_clean" entry regardless of what the pipeline
+    // actually found.
+    if (sample && sample.live && Array.isArray(sample.liveCites) && sample.liveCites.length) return sample.liveCites
+    return this.CITES[sample && sample.graphType] || this.CITES._clean
+  }
 
   toggleCat = (i) => this.setState(s => ({ openCat: s.openCat === i ? -1 : i }))
 
@@ -410,6 +460,55 @@ export default class App extends React.Component {
   resetRun() { this.clearTimers(); this.setState({ dstate: {}, graphShow: false, fanIn: false, verdictShow: false, ingestCount: 0, ingestDone: false, queueArrived: 0, orchShow: false, reportProgress: 0, filed: false, reportModal: false, explainOpen: false }) }
 
   launch = () => { this.resetRun(); this.setState({ view: 'run', step: 1 }); this.after(200, () => this.startFeed()) }
+
+  openReviewQueue = () => {
+    this.setState({ view: 'review', reviewSelectedId: null })
+    this.loadReviewCases()
+  }
+
+  loadReviewCases = () => {
+    this.setState({ reviewLoading: true, reviewError: null })
+    fetch(`${this.BACKEND}/api/cases?needs_review=true`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
+      .then(data => this.setState({ reviewCases: data.cases || [], reviewLoading: false }))
+      .catch(err => this.setState({ reviewError: String(err), reviewLoading: false }))
+    // Decided cases previously just vanished from the pending list with no
+    // trace anywhere in the UI -- the buttons DID persist a real decision
+    // (to case_memory.json and a real L6 audit block), but nothing showed
+    // that, so it read as a no-op. This pulls the resolved ones back so the
+    // consequence of clicking is actually visible.
+    fetch(`${this.BACKEND}/api/cases`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
+      .then(data => this.setState({ reviewDecidedCases: (data.cases || []).filter(c => c.reviewer_decision) }))
+      .catch(() => {})
+  }
+
+  selectReviewCase = (caseId) => this.setState({ reviewSelectedId: caseId })
+
+  submitReviewDecision = (caseId, decision, txId) => {
+    this.setState({ reviewSubmitting: true })
+    fetch(`${this.BACKEND}/api/cases/${caseId}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewer_id: 'demo_reviewer', decision, notes: '' })
+    })
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
+      .then(data => {
+        this.setState({
+          reviewSubmitting: false, reviewSelectedId: null,
+          reviewLastDecision: { txId, decision, auditBlockIndex: data.audit_block_index }
+        })
+        this.loadReviewCases()
+      })
+      .catch(err => this.setState({ reviewSubmitting: false, reviewError: String(err) }))
+  }
+
+  checkAuditChain = () => {
+    fetch(`${this.BACKEND}/api/audit/verify`)
+      .then(r => r.json())
+      .then(data => this.setState({ reviewAuditStatus: data }))
+      .catch(err => this.setState({ reviewAuditStatus: { valid: false, reason: String(err) } }))
+  }
   back = () => { this.clearTimers(); this.setState({ view: 'overview' }) }
   replay = () => { this.goStep(this.state.step) }
   replayAll = () => { this.goStep(1) }
@@ -774,12 +873,19 @@ export default class App extends React.Component {
       iconStyle: `flex:none;width:30px;height:30px;border-radius:9px;background:${vtone};color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700`
     }
 
-    // scenario typology graph
+    // scenario typology graph -- only the 6 canned demo scenarios
+    // (mule/structuring/velocity/geo/fema) have a hand-built diagram;
+    // renderGraph() returns null for anything else, including every live
+    // transaction (graphType '_live'). Previously showGraph only checked
+    // "is graphType truthy" (which '_live' is), so the wrapping panel
+    // still rendered with an empty SVG -- reserved blank space rather than
+    // an honest "nothing to show here".
     const gm = S.graphMeta || {}
-    const showGraph = st.graphShow && !!S.graphType
+    const graphSvg = st.graphShow ? this.renderGraph(S.graphType) : null
+    const showGraph = st.graphShow && !!graphSvg
     const graph = {
       show: showGraph, title: gm.title || '', tag: gm.tag || '', desc: gm.desc || '',
-      svg: showGraph ? this.renderGraph(S.graphType) : null,
+      svg: graphSvg,
       wrapStyle: `margin-top:22px;background:${vtone}0d;border:1px solid ${vtone}44;border-radius:18px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.04)`,
       dotStyle: `flex:none;width:9px;height:9px;border-radius:50%;background:${vtone};box-shadow:0 0 0 4px ${vtone}2b`,
       titleStyle: `font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:17px;color:${vtone}`,
@@ -835,17 +941,24 @@ export default class App extends React.Component {
     let rFields, headerTitle, headerTag, filingTarget, doneText, headerTone
     if (hasReport) {
       headerTone = V.tone === 'hit' ? '#e0455a' : '#cf861b'
-      headerTitle = 'Suspicious Transaction Report'
-      headerTag = 'STR · auto-generated'
-      filingTarget = 'FIU-IND'
+      const action = S.l4RecommendedAction
+      const actionLabel = action ? action.replace(/_/g, ' ') : null
+      headerTitle = actionLabel ? `Recommendation: ${actionLabel}` : (V.title || 'Dispute Evidence Packet')
+      headerTag = 'Dispute Evidence Packet'
+      filingTarget = 'human review queue'
+      let packetStatus
+      if (S.strPdfUrl) packetStatus = 'Generated (see PDF)'
+      else if (!S.live) packetStatus = 'Not yet run against the live pipeline'
+      else if (S.l4Disposition === 'ESCALATE_L5') packetStatus = 'Escalated to L5 — the SLM could not produce a schema-valid packet in 3 attempts'
+      else packetStatus = 'Not generated — L3 confidence was below the 0.70 auto-file threshold'
       rFields = [
-        ['Report type', V.title.includes('BLOCK') ? 'STR + payment block' : 'Suspicious Transaction Report (STR)'],
-        ['Filed to', 'FIU-IND · under PMLA 2002'],
+        ['Recommended action', actionLabel || 'No automatic recommendation — awaiting human review'],
         ['Transaction', S.reference + ' · ' + S.amount.replace('.00', '')],
-        ['Trigger', S.graphMeta ? S.graphMeta.trigger : 'Multiple risk indicators'],
-        ['Deadline', '7 days (regulatory)']
+        ['Why flagged', V.line || (S.graphMeta ? S.graphMeta.trigger : 'See detection agents above')],
+        ['Packet status', packetStatus],
+        ['Routing', filingTarget]
       ]
-      doneText = 'Filed within deadline'
+      doneText = S.strPdfUrl ? 'Packet generated' : 'Routed for review'
     } else {
       headerTone = '#1f9d63'
       headerTitle = 'No report required'
@@ -878,7 +991,14 @@ export default class App extends React.Component {
       geo: { conf: 91, rule: 'FRD-GEO-009 · Impossible travel', summary: 'Two authenticated sessions ~11,000 km apart within 9 minutes on one credential — strong account-takeover indicator.' },
       fema: { conf: 99, rule: 'FEMA-LRS-002 · Outward-remittance ceiling', summary: 'Cumulative outward remittance of USD 268,000 breaches the USD 250,000 LRS financial-year ceiling.' }
     }
-    const cm = (S.graphType && CONFMETA[S.graphType]) ? CONFMETA[S.graphType] : { conf: V.tone === 'clear' ? 3 : (S.liveCites && S.liveCites.length ? 92 : 75), rule: V.tone === 'clear' ? 'STP-000 · No typology match' : 'L2/L3 · Dynamic detection', summary: V.line || 'Live transaction processed via the orchestrator pipeline.' }
+    // Real confidence when we have a live result -- this used to show a
+    // HARDCODED 92 (or 75, or 3) here regardless of the actual L3 score,
+    // while the real number sat in tiny text elsewhere on the same screen.
+    // That's what made a 0.550 case display a giant "92%" you couldn't trust.
+    const liveConf = S.verdict && typeof S.verdict.confidence === 'number' ? Math.round(S.verdict.confidence * 100) : null
+    const cm = (S.graphType && CONFMETA[S.graphType]) ? CONFMETA[S.graphType]
+      : liveConf !== null ? { conf: liveConf, rule: 'L2/L3 · Dynamic detection', summary: V.line || 'Live transaction processed via the orchestrator pipeline.' }
+      : { conf: V.tone === 'clear' ? 3 : 75, rule: V.tone === 'clear' ? 'STP-000 · No typology match' : 'L2/L3 · Dynamic detection', summary: V.line || 'Live transaction processed via the orchestrator pipeline.' }
     const cleared = V.tone === 'clear'
     const confTone = cleared ? '#1f9d63' : (cm.conf >= 90 ? '#e0455a' : '#cf861b')
     report.openReport = this.openReport; report.closeReport = this.closeReport; report.stop = this.stopEvt; report.modalOpen = st.reportModal
@@ -940,15 +1060,25 @@ export default class App extends React.Component {
       }
     })
     const citations = this.citesFor(S).map(c => {
+      const badgeStyle = `flex:none;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:11px;color:#fff;background:#2f7fd6;border-radius:7px;padding:4px 9px;letter-spacing:.2px`
       if (typeof c === 'string') {
-        return { code: 'CITATION', ref: '', note: c, url: '', badgeStyle: `flex:none;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:11px;color:#fff;background:#2f7fd6;border-radius:7px;padding:4px 9px;letter-spacing:.2px` }
+        return { code: 'CITATION', ref: '', note: c, url: '', badgeStyle }
+      }
+      // Two possible object shapes reach here: the canned demo CITES dict
+      // ({code, ref, note, url}), or a real LLM citation_trail entry
+      // ({clause_no/rule_designation/chunk_id, citation/why_it_matters,
+      // clause/excerpt, url}). Previously only the second shape's field
+      // names were read, so every canned-dict entry fell through to
+      // 'UNKNOWN' regardless of its own .code.
+      if (c.code) {
+        return { code: String(c.code).toUpperCase(), ref: c.ref || '', note: c.note || '', url: c.url || '', badgeStyle }
       }
       return {
         code: (c.clause_no || c.rule_designation || c.chunk_id || 'UNKNOWN').toUpperCase(),
         ref: (c.citation || c.why_it_matters || ''),
         note: (c.clause || c.excerpt || ''),
         url: c.url || '',
-        badgeStyle: `flex:none;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:11px;color:#fff;background:#2f7fd6;border-radius:7px;padding:4px 9px;letter-spacing:.2px`
+        badgeStyle
       }
     })
     const outcome = {
@@ -998,7 +1128,7 @@ export default class App extends React.Component {
 
     return {
       lanes, categories, scans,
-      showOverview: st.view === 'overview', showRun: st.view === 'run',
+      showOverview: st.view === 'overview', showRun: st.view === 'run', showReview: st.view === 'review',
       isFeed: st.step === 1, isIngest: st.step === 2, isDetect: st.step === 3, isReport: st.step === 4, isOutcome: st.step === 5,
       payment: { amount: S.amount, sender: S.sender, receiver: S.receiver, channel: S.channel, reference: S.reference },
       samples, samplePager, steps, agents, orch, explain,
@@ -1019,6 +1149,10 @@ export default class App extends React.Component {
             <div style={S("width:34px;height:34px;border-radius:9px;background:linear-gradient(150deg,#5b8def,#7c5bef);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;font-family:'Space Grotesk',sans-serif;letter-spacing:.5px")}>CP</div>
             <div style={S("font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:16px")}>Compliance Pipeline</div>
           </div>
+          <Hover onClick={this.openReviewQueue} style="cursor:pointer;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);color:#54504a;font-size:13px;padding:8px 14px;border-radius:9px;display:flex;align-items:center;gap:7px" hoverStyle="background:rgba(0,0,0,.07)">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 4h12M2 8h12M2 12h8" /></svg>
+            Review Queue
+          </Hover>
         </div>
 
         <div style={S('max-width:1080px;margin:0 auto;padding:28px 28px 36px')}>
@@ -1119,12 +1253,18 @@ export default class App extends React.Component {
             <div style={S("font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:15px")}>Compliance Pipeline</div>
           </div>
           <div style={S('display:flex;align-items:center;gap:10px')}>
+            <Hover onClick={this.openReviewQueue} style="cursor:pointer;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);color:#54504a;font-size:12.5px;padding:8px 14px;border-radius:9px;display:flex;align-items:center;gap:7px" hoverStyle="background:rgba(0,0,0,.07)"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 4h12M2 8h12M2 12h8" /></svg>Review Queue</Hover>
             <Hover onClick={this.replay} style="cursor:pointer;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);color:#54504a;font-size:12.5px;padding:8px 14px;border-radius:9px;display:flex;align-items:center;gap:7px" hoverStyle="background:rgba(0,0,0,.07)"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2"><path d="M13 8a5 5 0 11-1.5-3.5M13 2v3h-3" /></svg>Replay this step</Hover>
             <Hover onClick={this.back} style="cursor:pointer;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);color:#54504a;font-size:13px;padding:8px 14px;border-radius:9px;display:flex;align-items:center;gap:7px" hoverStyle="background:rgba(0,0,0,.07)"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 3L5 8l5 5" /></svg>Back to overview</Hover>
           </div>
         </div>
 
         <div style={S('max-width:1120px;margin:0 auto;padding:26px 26px 80px')}>
+          {this.state.lastLiveError && (
+            <div style={S('background:#a00000;color:#fff;font-size:12.5px;font-weight:600;border-radius:10px;padding:10px 14px;margin-bottom:16px;display:flex;align-items:center;gap:8px')}>
+              ⚠ {this.state.lastLiveError}
+            </div>
+          )}
           <div style={S('display:flex;align-items:stretch;gap:10px;margin-bottom:30px;flex-wrap:wrap')}>
             {V.steps.map((st, i) => (
               <button key={i} onClick={st.onClick} style={S(st.style)}>
@@ -1726,12 +1866,233 @@ export default class App extends React.Component {
     )
   }
 
+  renderReview(V) {
+    const cases = this.state.reviewCases
+    const selected = cases.find(c => c.case_id === this.state.reviewSelectedId) || null
+    const actionColor = { CONTEST_WITH_EVIDENCE: '#1f8a5b', CONCEDE: '#b23a52', ESCALATE_TO_REVIEW: '#cf861b' }
+    const audit = this.state.reviewAuditStatus
+
+    return (
+      <div style={S('min-height:100vh;background:radial-gradient(120% 90% at 15% -10%, #f8f5f0 0%, #f6f3ee 45%, #efeae2 100%);background-color:#f5f1ea;color:#1a1712')}>
+        <div style={S('display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-bottom:1px solid rgba(0,0,0,.08);position:sticky;top:0;background:rgba(245,241,234,.85);backdrop-filter:blur(12px);z-index:30')}>
+          <div style={S('display:flex;align-items:center;gap:12px')}>
+            <div style={S("width:32px;height:32px;border-radius:9px;background:linear-gradient(150deg,#5b8def,#7c5bef);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;font-family:'Space Grotesk',sans-serif")}>CP</div>
+            <div style={S("font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:15px")}>Human Review Queue</div>
+          </div>
+          <div style={S('display:flex;align-items:center;gap:10px')}>
+            <Hover onClick={this.loadReviewCases} style="cursor:pointer;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);color:#54504a;font-size:12.5px;padding:8px 14px;border-radius:9px" hoverStyle="background:rgba(0,0,0,.07)">Refresh</Hover>
+            <Hover onClick={() => this.setState({ view: 'overview' })} style="cursor:pointer;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);color:#54504a;font-size:13px;padding:8px 14px;border-radius:9px" hoverStyle="background:rgba(0,0,0,.07)">Back to overview</Hover>
+          </div>
+        </div>
+
+        <div style={S('max-width:1180px;margin:0 auto;padding:26px 26px 80px;display:grid;grid-template-columns:360px 1fr;gap:20px;align-items:start')}>
+
+          {/* ---- Case list ---- */}
+          <div style={S('background:#fffdfa;border:1px solid rgba(0,0,0,.08);border-radius:13px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.05)')}>
+            <div style={S('padding:12px 16px;background:#fffdfa;border-bottom:1px solid rgba(0,0,0,.08);display:flex;align-items:center;justify-content:space-between;gap:10px')}>
+              <div style={S("display:flex;align-items:center;gap:8px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:1.5px;color:#8a8478")}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#cf861b" strokeWidth="2"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" /></svg>
+                PENDING DECISIONS
+              </div>
+              <span style={S("flex:none;font-size:10.5px;padding:3.5px 9px;border-radius:6px;font-weight:600;font-family:'Space Grotesk',sans-serif;color:#cf861b;background:#cf861b18;border:1px solid #cf861b40")}>{cases.length}</span>
+            </div>
+            <div style={S('padding:10px 16px;border-bottom:1px solid rgba(0,0,0,.06);font-size:11.5px;color:#8a8478')}>Confidence 0.50–0.70 · not yet decided</div>
+
+            {this.state.reviewLoading && <div style={S('padding:24px 16px;color:#8a8478;font-size:13px;text-align:center')}>Loading…</div>}
+            {this.state.reviewError && <div style={S('padding:16px;color:#b23a52;font-size:13px')}>Error: {this.state.reviewError}</div>}
+            {!this.state.reviewLoading && cases.length === 0 && !this.state.reviewError && (
+              <div style={S('padding:30px 16px;color:#8a8478;font-size:13px;text-align:center;line-height:1.5')}>No cases currently need review —<br />everything is either auto-cleared or auto-filed.</div>
+            )}
+
+            <div style={S('max-height:640px;overflow-y:auto')}>
+              {cases.map(c => {
+                const isSel = this.state.reviewSelectedId === c.case_id
+                const aColor = actionColor[c.l4_recommended_action] || '#8a8478'
+                return (
+                  <div key={c.case_id} onClick={() => this.selectReviewCase(c.case_id)}
+                    style={{
+                      cursor: 'pointer', padding: '12px 16px',
+                      borderBottom: '1px solid rgba(0,0,0,.05)',
+                      borderLeft: isSel ? '3px solid #5b8def' : '3px solid transparent',
+                      background: isSel ? 'rgba(91,141,239,.07)' : 'transparent',
+                      transition: 'background .15s'
+                    }}
+                    onMouseEnter={e => { if (!isSel) e.currentTarget.style.background = 'rgba(0,0,0,.025)' }}
+                    onMouseLeave={e => { if (!isSel) e.currentTarget.style.background = 'transparent' }}>
+                    <div style={S('display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px')}>
+                      <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: '12.5px', fontWeight: 600, color: isSel ? '#3a5fbf' : '#3a352e' }}>{c.tx_id}</span>
+                      {c.l4_recommended_action && (
+                        <span style={S(`flex:none;font-size:10px;font-weight:700;padding:3px 8px;border-radius:6px;color:${aColor};background:${aColor}18;border:1px solid ${aColor}40;white-space:nowrap`)}>
+                          {c.l4_recommended_action.replace(/_/g, ' ')}
+                        </span>
+                      )}
+                    </div>
+                    <div style={S("font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:500;color:#1a1712")}>{c.sender_name || 'Unknown'}</div>
+                    <div style={S('display:flex;align-items:center;justify-content:space-between;margin-top:4px')}>
+                      <span style={S("font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#8a8478")}>{c.dispute_reason || 'no dispute reason'}</span>
+                      <span style={S("flex:none;font-family:'Space Grotesk',sans-serif;font-size:12.5px;font-weight:600;color:#54504a")}>₹{Number(c.amount_inr || 0).toLocaleString('en-IN')}</span>
+                    </div>
+                    <div style={S('margin-top:7px;display:flex;align-items:center;gap:6px')}>
+                      <div style={S('flex:1;height:4px;border-radius:2px;background:rgba(0,0,0,.06);overflow:hidden')}>
+                        <div style={{ width: `${Math.round((c.confidence || 0) * 100)}%`, height: '100%', background: '#cf861b', borderRadius: '2px' }}></div>
+                      </div>
+                      <span style={S("flex:none;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#a9a297")}>{Number(c.confidence || 0).toFixed(2)}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* ---- Case detail ---- */}
+          <div style={S('background:#fffdfa;border:1px solid rgba(0,0,0,.07);border-radius:16px;padding:22px;box-shadow:0 1px 2px rgba(0,0,0,.04);min-height:300px')}>
+            {!selected && (
+              <div style={S('color:#8a8478;font-size:13.5px')}>Select a case from the queue to see its full dossier — transaction facts, detector triggers, the L3 reasoning + citations, and L4's recommended action.</div>
+            )}
+            {selected && (
+              <div>
+                <div style={S('display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px')}>
+                  <div>
+                    <div style={S("font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:18px")}>{selected.tx_id}</div>
+                    <div style={S('font-size:12.5px;color:#8a8478;margin-top:2px')}>{selected.sender_name} → {selected.receiver_name} · {selected.channel}</div>
+                  </div>
+                  <div style={S(`font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:13px;color:${actionColor[selected.l4_recommended_action] || '#8a8478'};background:${actionColor[selected.l4_recommended_action] || '#8a8478'}14;border:1px solid ${actionColor[selected.l4_recommended_action] || '#8a8478'}44;padding:6px 12px;border-radius:9px`)}>
+                    Recommended: {(selected.l4_recommended_action || 'ESCALATE_TO_REVIEW').replace(/_/g, ' ')}
+                  </div>
+                </div>
+
+                <div style={S('display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px')}>
+                  {[
+                    ['Amount', `₹${Number(selected.amount_inr || 0).toLocaleString('en-IN')}`],
+                    ['Delivery status', selected.delivery_status || 'n/a'],
+                    ['Dispute reason', selected.dispute_reason || 'n/a'],
+                    ['L3 confidence', Number(selected.confidence || 0).toFixed(3)],
+                  ].map(([k, v], i) => (
+                    <div key={i} style={S('background:rgba(0,0,0,.03);border-radius:10px;padding:9px 11px')}>
+                      <div style={S("font-family:'IBM Plex Mono',monospace;font-size:10px;color:#8a8478;letter-spacing:.5px")}>{k.toUpperCase()}</div>
+                      <div style={S('font-size:13px;font-weight:600;margin-top:3px')}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={S("font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8a8478;margin-bottom:6px")}>DETECTOR TRIGGERS</div>
+                <div style={S('display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px')}>
+                  {(selected.triggers_fired || []).length === 0 && <span style={S('font-size:12.5px;color:#8a8478')}>none</span>}
+                  {(selected.triggers_fired || []).map((t, i) => (
+                    <span key={i} style={S('font-size:11.5px;font-family:\'IBM Plex Mono\',monospace;background:rgba(0,0,0,.05);border-radius:7px;padding:4px 9px')}>{t}</span>
+                  ))}
+                </div>
+
+                <div style={S("font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8a8478;margin-bottom:6px")}>REASONING</div>
+                <p style={S('font-size:13px;line-height:1.55;color:#3a352e;margin:0 0 16px')}>{selected.explanation || 'No explanation recorded.'}</p>
+
+                {Array.isArray(selected.citation_trail) && selected.citation_trail.length > 0 && (
+                  <>
+                    <div style={S("font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8a8478;margin-bottom:6px")}>CITATIONS</div>
+                    <div style={S('margin-bottom:16px')}>
+                      {selected.citation_trail.map((c, i) => (
+                        <div key={i} style={S('border-left:2px solid #7c5bef;padding:2px 0 8px 12px;margin-bottom:8px')}>
+                          <div style={S('font-size:12.5px;color:#3a352e;line-height:1.5')}>{c.excerpt}</div>
+                          <div style={S('font-size:11px;color:#8a8478;margin-top:3px')}>{c.why_it_matters}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {selected.str_pdf_url && (
+                  <a href={selected.str_pdf_url.startsWith('http') ? selected.str_pdf_url : this.BACKEND + selected.str_pdf_url} target="_blank" rel="noopener"
+                    style={S("display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:#2f7fd6;text-decoration:none;margin-bottom:18px")}>
+                    Open Dispute Evidence Packet PDF ↗
+                  </a>
+                )}
+
+                {selected.reviewer_decision ? (
+                  <div style={S('background:rgba(31,138,91,.08);border:1px solid rgba(31,138,91,.3);border-radius:10px;padding:12px 14px;font-size:13px')}>
+                    Decision recorded: <b>{selected.reviewer_decision}</b> by {selected.reviewer_id} at {selected.reviewed_at}
+                  </div>
+                ) : (
+                  <div style={S('display:flex;gap:10px;margin-top:4px;padding-top:14px;border-top:1px solid rgba(0,0,0,.06)')}>
+                    <Hover onClick={() => this.submitReviewDecision(selected.case_id, 'CONFIRMED_FRAUD', selected.tx_id)} disabled={this.state.reviewSubmitting}
+                      style="cursor:pointer;font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;color:#fff;background:#b23a52;border:none;padding:10px 16px;border-radius:10px" hoverStyle="filter:brightness(1.08)">
+                      Confirm Fraud
+                    </Hover>
+                    <Hover onClick={() => this.submitReviewDecision(selected.case_id, 'DISMISSED', selected.tx_id)} disabled={this.state.reviewSubmitting}
+                      style="cursor:pointer;font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;color:#fff;background:#1f8a5b;border:none;padding:10px 16px;border-radius:10px" hoverStyle="filter:brightness(1.08)">
+                      Dismiss (False Positive)
+                    </Hover>
+                    <Hover onClick={() => this.submitReviewDecision(selected.case_id, 'ESCALATE', selected.tx_id)} disabled={this.state.reviewSubmitting}
+                      style="cursor:pointer;font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;color:#3a352e;background:rgba(0,0,0,.05);border:1px solid rgba(0,0,0,.1);padding:10px 16px;border-radius:10px" hoverStyle="background:rgba(0,0,0,.08)">
+                      Escalate Further
+                    </Hover>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ---- Confirmation toast: proof the button actually did something ---- */}
+        {this.state.reviewLastDecision && (
+          <div style={S('max-width:1180px;margin:0 auto 20px;padding:0 26px')}>
+            <div style={S('background:rgba(31,138,91,.1);border:1px solid rgba(31,138,91,.35);border-radius:12px;padding:12px 16px;font-size:13px;color:#1f8a5b;display:flex;align-items:center;justify-content:space-between')}>
+              <span>✓ Decision recorded for <b>{this.state.reviewLastDecision.txId}</b>: <b>{this.state.reviewLastDecision.decision}</b> — permanently logged as audit block #{this.state.reviewLastDecision.auditBlockIndex}.</span>
+              <Hover onClick={() => this.setState({ reviewLastDecision: null })} style="cursor:pointer;color:#1f8a5b;font-size:16px;line-height:1;padding:2px 6px">×</Hover>
+            </div>
+          </div>
+        )}
+
+        {/* ---- Recently decided cases -- previously these just vanished with no trace ---- */}
+        {this.state.reviewDecidedCases.length > 0 && (
+          <div style={S('max-width:1180px;margin:0 auto 24px;padding:0 26px')}>
+            <div style={S('background:#fffdfa;border:1px solid rgba(0,0,0,.07);border-radius:16px;overflow:hidden')}>
+              <div style={S('padding:14px 16px;border-bottom:1px solid rgba(0,0,0,.06)')}>
+                <div style={S("font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8a8478")}>RECENTLY DECIDED</div>
+                <div style={S("font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:15px;margin-top:2px")}>{this.state.reviewDecidedCases.length} case{this.state.reviewDecidedCases.length === 1 ? '' : 's'} resolved by a reviewer</div>
+              </div>
+              {this.state.reviewDecidedCases.map(c => (
+                <div key={c.case_id} style={S('display:flex;justify-content:space-between;align-items:center;padding:11px 16px;border-bottom:1px solid rgba(0,0,0,.04)')}>
+                  <div>
+                    <span style={S("font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600")}>{c.tx_id}</span>
+                    <span style={S('font-size:12px;color:#8a8478;margin-left:10px')}>{c.sender_name} · ₹{Number(c.amount_inr || 0).toLocaleString('en-IN')}</span>
+                  </div>
+                  <div style={S('font-size:11.5px;color:#54504a')}>
+                    <b>{c.reviewer_decision}</b> by {c.reviewer_id} · {c.reviewed_at ? new Date(c.reviewed_at).toLocaleString('en-IN') : ''}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ---- Audit chain integrity strip ---- */}
+        <div style={S('max-width:1180px;margin:0 auto 40px;padding:0 26px')}>
+          <div style={S('background:#fffdfa;border:1px solid rgba(0,0,0,.07);border-radius:14px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between')}>
+            <div>
+              <div style={S("font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13.5px")}>L6 audit chain</div>
+              <div style={S('font-size:11.5px;color:#8a8478;margin-top:2px')}>
+                {audit ? (audit.valid
+                  ? `Verified — ${audit.blocks_checked} blocks, unbroken chain.`
+                  : `TAMPERED — block #${audit.first_bad_index}: ${audit.reason}`)
+                  : 'Not checked yet this session.'}
+              </div>
+            </div>
+            <Hover onClick={this.checkAuditChain} style="cursor:pointer;background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.1);color:#54504a;font-size:12.5px;padding:8px 14px;border-radius:9px" hoverStyle="background:rgba(0,0,0,.07)">
+              Verify chain
+            </Hover>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   render() {
     const V = this.renderVals()
     return (
       <>
         {V.showOverview && this.renderOverview(V)}
         {V.showRun && this.renderRun(V)}
+        {V.showReview && this.renderReview(V)}
         {this.renderCircModal(V)}
       </>
     )

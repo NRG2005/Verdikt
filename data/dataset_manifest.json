@@ -1,0 +1,14 @@
+{
+  "n_transactions": 909,
+  "n_accounts": 260,
+  "n_merchants": 40,
+  "label_counts": {
+    "legitimate": 682,
+    "merchant_error": 66,
+    "friendly_fraud": 85,
+    "true_fraud": 76
+  },
+  "holdout_count": 273,
+  "train_count": 636,
+  "seed": 20260902
+}

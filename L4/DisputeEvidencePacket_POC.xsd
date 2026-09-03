@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Dispute Evidence Packet -Track 02 retrofit.
+
+  This is an ORIGINAL POC schema authored for this hackathon submission, NOT a
+  reconstruction of any real card network's operating-regulations XSD (unlike
+  the AML pipeline's TransactionBasedReport_POC.xsd, which was reconstructed
+  from FIU-IND's public Reporting Format Guide -no equivalent public,
+  network-neutral schema exists for dispute evidence packets, so this one is
+  hand-designed). Structurally it mirrors the same element depth and
+  RULE/STATIC/SYSDATE/L0/SLM field-provenance discipline as the STR schema it
+  replaces, so the generate -> validate -> repair engine in
+  l4_report_generator.py needed no structural changes, only new field names
+  and enum values.
+
+  A production version would target a real card network's dispute-response
+  API/schema (e.g. Visa VROL, Mastercard's dispute submission format) once
+  that access exists; nothing else in the pipeline would need to change to
+  make that swap, matching the same swap-the-XSD contract the original STR
+  schema documented.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" elementFormDefault="qualified">
+
+  <!-- ============ simple types / enumerations ============ -->
+
+  <xs:simpleType name="PacketTypeEnum">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="DISPUTE_RESPONSE"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="ResponseTypeEnum">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="N"/>   <!-- New -->
+      <xs:enumeration value="R"/>   <!-- Resubmission -->
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- POC. The three card-network dispute categories described in
+       dispute-reasoncodes-poc-001 (regulation_corpus.json). This field is
+       RULE-derived directly from the cardholder's own stated dispute reason,
+       not an SLM judgment call -the issuing bank assigns the category when
+       the dispute is filed, so it's a fact, not an inference. -->
+  <xs:simpleType name="DisputeReasonCategoryEnum_POC">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="FRAUD"/>
+      <xs:enumeration value="CONSUMER_DISPUTE"/>
+      <xs:enumeration value="PROCESSING_ERROR"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- POC. What the merchant should do about this case. -->
+  <xs:simpleType name="RecommendedActionEnum_POC">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="CONTEST_WITH_EVIDENCE"/>
+      <xs:enumeration value="CONCEDE"/>
+      <xs:enumeration value="ESCALATE_TO_REVIEW"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- POC. Fulfilment status as recorded by the merchant at the time of
+       assessment -RULE-derived from the transaction's own delivery_status
+       field, not an SLM judgment call. -->
+  <xs:simpleType name="DeliveryStatusEnum_POC">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="DELIVERED"/>
+      <xs:enumeration value="IN_TRANSIT"/>
+      <xs:enumeration value="NOT_DELIVERED"/>
+      <xs:enumeration value="RETURNED"/>
+      <xs:enumeration value="NOT_APPLICABLE"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- POC. The evidence-hierarchy tiers described in
+       compelling-evidence-poc-002 (regulation_corpus.json). -->
+  <xs:simpleType name="EvidenceTierEnum_POC">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="TIER1_CONFIRMED_DELIVERY"/>
+      <xs:enumeration value="TIER2_DEVICE_IP_MATCH"/>
+      <xs:enumeration value="TIER3_MERCHANT_RECORDS_ONLY"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="PartyRoleEnum">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="CARDHOLDER"/>
+      <xs:enumeration value="MERCHANT"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="DebitCreditEnum">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="D"/>
+      <xs:enumeration value="C"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="DateYMD">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="\d{4}-\d{2}-\d{2}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- ============ reusable complex types ============ -->
+
+  <xs:complexType name="PersonType">
+    <xs:sequence>
+      <xs:element name="Role" type="PartyRoleEnum"/>
+      <xs:element name="Name" type="xs:string"/>
+      <xs:element name="PAN" type="xs:string" minOccurs="0"/>
+      <xs:element name="DOB" type="DateYMD" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- ============ root: Batch ============ -->
+
+  <xs:element name="Batch">
+    <xs:complexType>
+      <xs:sequence>
+
+        <xs:element name="BatchHeader">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="DataStructureVersion" type="xs:string"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+
+        <xs:element name="PacketType" type="PacketTypeEnum"/>
+
+        <xs:element name="RespondingMerchant">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="MerchantName" type="xs:string"/>
+              <xs:element name="MerchantRefNum" type="xs:string"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+
+        <xs:element name="CaseOfficer">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="Name" type="xs:string"/>
+              <xs:element name="Email" type="xs:string" minOccurs="0"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+
+        <xs:element name="BatchDetails">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="BatchNumber" type="xs:string"/>
+              <xs:element name="BatchDate" type="DateYMD"/>
+              <xs:element name="ResponseType" type="ResponseTypeEnum"/>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+
+        <!-- one dispute case = one Case (batch can hold many; POC = 1) -->
+        <xs:element name="Case" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+
+              <xs:element name="CaseSerialNum" type="xs:string"/>
+              <xs:element name="PrincipalPartyName" type="xs:string"/>
+
+              <xs:element name="EvidenceAssessment">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="RecommendedAction" type="RecommendedActionEnum_POC"/>
+                    <xs:element name="DisputeReasonCategory" type="DisputeReasonCategoryEnum_POC"/>
+                    <xs:element name="EvidenceTier" type="EvidenceTierEnum_POC"/>
+                    <xs:element name="EvidenceSummary" type="xs:string"/>
+                    <xs:element name="RuleCitation" type="xs:string" minOccurs="0"/>
+                    <xs:element name="DateOfAssessment" type="DateYMD"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+
+              <xs:element name="Transaction" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="TransactionNumber" type="xs:string"/>
+                    <xs:element name="TransactionDate" type="DateYMD"/>
+                    <xs:element name="DeliveryStatus" type="DeliveryStatusEnum_POC"/>
+                    <xs:element name="DebitCredit" type="DebitCreditEnum"/>
+                    <xs:element name="Amount" type="xs:decimal"/>
+                    <xs:element name="Currency" type="xs:string"/>
+                    <xs:element name="CardholderDetails" type="PersonType"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+
+              <xs:element name="RelatedParties" type="PersonType" minOccurs="0" maxOccurs="unbounded"/>
+
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>
